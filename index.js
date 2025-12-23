@@ -1,21 +1,218 @@
 const express = require('express');
 const app = express();
 const tokenStore = require('./tokenStore');
+const withingsClient = require('./withingsClient');
+const { DateTime } = require('luxon');
 
-// GET endpoint at /health/daily
-app.get('/health/daily', (req, res) => {
-  const healthSnapshot = {
-    date: new Date().toISOString().split('T')[0], // Current date in YYYY-MM-DD format
-    sleep_score: 85,
-    sleep_duration_minutes: 420,
-    resting_hr: 58,
-    hrv: 45,
-    spo2: 98,
-    weight: 75.5
-  };
-
-  res.status(200).json(healthSnapshot);
+// GET endpoint at /health/daily - Real Withings data
+app.get('/health/daily', async (req, res) => {
+  try {
+    // Get date parameter or default to today in Asia/Jerusalem
+    const dateParam = req.query.date;
+    const timezone = 'Asia/Jerusalem';
+    
+    let targetDate;
+    if (dateParam) {
+      targetDate = DateTime.fromISO(dateParam, { zone: timezone });
+      if (!targetDate.isValid) {
+        return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
+      }
+    } else {
+      targetDate = DateTime.now().setZone(timezone);
+    }
+    
+    const dateStr = targetDate.toISODate();
+    const startOfDay = targetDate.startOf('day');
+    const endOfDay = startOfDay.plus({ days: 1 });
+    const startTs = Math.floor(startOfDay.toSeconds());
+    const endTs = Math.floor(endOfDay.toSeconds());
+    
+    // Get valid access token (auto-refreshes if needed)
+    let accessToken;
+    try {
+      accessToken = await tokenStore.getValidAccessToken();
+    } catch (error) {
+      return res.status(401).json({ error: 'withings_not_connected', message: error.message });
+    }
+    
+    const dataPoints = [];
+    const snapshot = {
+      weight_kg: null,
+      heart_pulse_bpm: null,
+      spo2_pct: null,
+      hrv: null,
+      sleep_score: null,
+      sleep_duration_minutes: null
+    };
+    
+    // Fetch measurements (weight, HR, SpO2, HRV, BP)
+    try {
+      const measureData = await withingsClient.formPost(
+        'https://wbsapi.withings.net/measure',
+        {
+          action: 'getmeas',
+          startdate: startTs,
+          enddate: endTs,
+          category: 1,
+          meastypes: '1,11,54,9,10,62'
+        },
+        accessToken
+      );
+      
+      if (measureData.status !== 0) {
+        console.error('Withings measure API error:', measureData);
+        return res.status(502).json({ error: 'withings_api_error', details: measureData });
+      }
+      
+      // Parse measurements
+      if (measureData.body && measureData.body.measuregrps) {
+        const latestValues = {};
+        
+        for (const grp of measureData.body.measuregrps) {
+          for (const measure of grp.measures) {
+            const meastype = measure.type;
+            const actualValue = measure.value * Math.pow(10, measure.unit);
+            
+            // Keep latest value per meastype
+            if (!latestValues[meastype] || grp.date > latestValues[meastype].date) {
+              latestValues[meastype] = {
+                value: actualValue,
+                ts: grp.date,
+                raw: {
+                  meastype,
+                  value: measure.value,
+                  unit: measure.unit,
+                  date: grp.date,
+                  deviceid: grp.deviceid,
+                  category: grp.category
+                }
+              };
+            }
+          }
+        }
+        
+        // Map meastypes to datapoints
+        const typeMapping = {
+          1: { key: 'weight_kg', snapshotKey: 'weight_kg', unit: 'kg' },
+          11: { key: 'heart_pulse_bpm', snapshotKey: 'heart_pulse_bpm', unit: 'bpm' },
+          54: { key: 'spo2_pct', snapshotKey: 'spo2_pct', unit: '%' },
+          62: { key: 'hrv_ms', snapshotKey: 'hrv', unit: 'ms' },
+          9: { key: 'diastolic_mmhg', snapshotKey: null, unit: 'mmHg' },
+          10: { key: 'systolic_mmhg', snapshotKey: null, unit: 'mmHg' }
+        };
+        
+        for (const [meastype, data] of Object.entries(latestValues)) {
+          const mapping = typeMapping[meastype];
+          if (mapping) {
+            dataPoints.push({
+              key: mapping.key,
+              value: data.value,
+              unit: mapping.unit,
+              ts: data.ts,
+              source: 'withings',
+              raw: data.raw
+            });
+            
+            if (mapping.snapshotKey) {
+              snapshot[mapping.snapshotKey] = data.value;
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching measurements:', error);
+      return res.status(502).json({ error: 'withings_measure_failed', message: error.message });
+    }
+    
+    // Fetch sleep data
+    try {
+      const sleepData = await withingsClient.formPost(
+        'https://wbsapi.withings.net/v2/sleep',
+        {
+          action: 'getsummary',
+          startdateymd: dateStr,
+          enddateymd: dateStr
+        },
+        accessToken
+      );
+      
+      if (sleepData.status !== 0) {
+        console.warn('Withings sleep API error:', sleepData);
+      } else if (sleepData.body && sleepData.body.series && sleepData.body.series.length > 0) {
+        // Find best overlapping sleep session
+        let bestSleep = null;
+        let maxOverlap = 0;
+        
+        for (const session of sleepData.body.series) {
+          const sessionStart = session.startdate;
+          const sessionEnd = session.enddate;
+          
+          // Calculate overlap with our target day
+          const overlapStart = Math.max(sessionStart, startTs);
+          const overlapEnd = Math.min(sessionEnd, endTs);
+          const overlap = Math.max(0, overlapEnd - overlapStart);
+          
+          if (overlap > maxOverlap) {
+            maxOverlap = overlap;
+            bestSleep = session;
+          }
+        }
+        
+        if (bestSleep) {
+          // Extract sleep score
+          if (bestSleep.data && bestSleep.data.sleep_score !== undefined) {
+            snapshot.sleep_score = bestSleep.data.sleep_score;
+            dataPoints.push({
+              key: 'sleep_score',
+              value: bestSleep.data.sleep_score,
+              unit: 'score',
+              ts: bestSleep.startdate,
+              source: 'withings',
+              raw: { session: bestSleep }
+            });
+          }
+          
+          // Extract sleep duration
+          const durationSeconds = bestSleep.data?.total_sleep_time || bestSleep.data?.total_timeinbed;
+          if (durationSeconds) {
+            const durationMinutes = Math.round(durationSeconds / 60);
+            snapshot.sleep_duration_minutes = durationMinutes;
+            dataPoints.push({
+              key: 'sleep_duration_minutes',
+              value: durationMinutes,
+              unit: 'minutes',
+              ts: bestSleep.startdate,
+              source: 'withings',
+              raw: { duration_seconds: durationSeconds }
+            });
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching sleep:', error);
+      // Don't fail the entire request for sleep data
+    }
+    
+    // Return structured response
+    res.json({
+      date: dateStr,
+      window: {
+        start_ts: startTs,
+        end_ts: endTs,
+        timezone
+      },
+      data_points: dataPoints,
+      snapshot
+    });
+    
+  } catch (error) {
+    console.error('Error in /health/daily:', error);
+    res.status(500).json({ error: 'internal_error', message: error.message });
+  }
 });
+
+
+
 
 app.get('/openapi.yaml', (req, res) => {
   res.type('text/yaml').send(`
@@ -29,37 +226,81 @@ paths:
   /health/daily:
     get:
       operationId: getDailyHealth
-      summary: Get daily health snapshot
+      summary: Get daily health snapshot with real Withings data
+      parameters:
+        - name: date
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Target date in YYYY-MM-DD format (defaults to today in Asia/Jerusalem)
       responses:
         "200":
-          description: OK
+          description: Daily health snapshot with measurements and sleep data
           content:
             application/json:
               schema:
                 type: object
                 required:
                   - date
-                  - sleep_score
-                  - sleep_duration_minutes
-                  - resting_hr
-                  - hrv
-                  - spo2
-                  - weight
+                  - window
+                  - data_points
+                  - snapshot
                 properties:
                   date:
                     type: string
-                  sleep_score:
-                    type: integer
-                  sleep_duration_minutes:
-                    type: integer
-                  resting_hr:
-                    type: integer
-                  hrv:
-                    type: integer
-                  spo2:
-                    type: integer
-                  weight:
-                    type: number
+                    format: date
+                  window:
+                    type: object
+                    properties:
+                      start_ts:
+                        type: integer
+                      end_ts:
+                        type: integer
+                      timezone:
+                        type: string
+                  data_points:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key:
+                          type: string
+                        value:
+                          type: number
+                        unit:
+                          type: string
+                        ts:
+                          type: integer
+                        source:
+                          type: string
+                        raw:
+                          type: object
+                  snapshot:
+                    type: object
+                    properties:
+                      weight_kg:
+                        type: number
+                        nullable: true
+                      heart_pulse_bpm:
+                        type: number
+                        nullable: true
+                      spo2_pct:
+                        type: number
+                        nullable: true
+                      hrv:
+                        type: number
+                        nullable: true
+                      sleep_score:
+                        type: number
+                        nullable: true
+                      sleep_duration_minutes:
+                        type: number
+                        nullable: true
+        "401":
+          description: Withings not connected or token expired
+        "502":
+          description: Withings API error
 `);
 });
 
