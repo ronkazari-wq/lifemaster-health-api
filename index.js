@@ -66,6 +66,26 @@ app.get("/auth/withings/callback", (req, res) => {
   res.status(200).send("Withings callback OK");
 });
 
+app.get("/auth/withings", (req, res) => {
+  const clientId = process.env.WITHINGS_CLIENT_ID;
+
+  if (!clientId) {
+    return res.status(500).send("WITHINGS_CLIENT_ID is not set");
+  }
+
+  const redirectUri = "https://lifemaster-health-api.onrender.com/auth/withings/callback";
+
+  const authUrl =
+    "https://account.withings.com/oauth2_user/authorize2" +
+    `?response_type=code` +
+    `&client_id=${clientId}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&scope=user.metrics,user.activity,user.sleep` +
+    `&state=lifemaster`;
+
+  res.redirect(authUrl);
+});
+
 // Start server on port from environment or default to 3000
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
