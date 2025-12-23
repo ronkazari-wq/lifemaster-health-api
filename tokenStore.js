@@ -18,14 +18,24 @@ async function saveTokens(accessToken, refreshToken, expiresIn) {
     
     if (error) {
       console.error('Error saving tokens to Supabase:', error.message);
-      return false;
+      return { 
+        ok: false, 
+        reason: error.message, 
+        code: error.code ?? null, 
+        hint: error.hint ?? null 
+      };
     }
     
     console.log('Tokens saved successfully to Supabase');
-    return true;
+    return { ok: true };
   } catch (error) {
     console.error('Error saving tokens:', error.message);
-    return false;
+    return { 
+      ok: false, 
+      reason: error.message, 
+      code: null, 
+      hint: null 
+    };
   }
 }
 
@@ -114,14 +124,14 @@ async function getValidAccessToken() {
     }
     
     // Save new tokens to Supabase
-    const saved = await saveTokens(
+    const saveResult = await saveTokens(
       data.body.access_token,
       data.body.refresh_token,
       data.body.expires_in
     );
     
-    if (!saved) {
-      throw new Error('Failed to save refreshed tokens');
+    if (!saveResult.ok) {
+      throw new Error(`Failed to save refreshed tokens: ${saveResult.reason}`);
     }
     
     console.log('Token refreshed successfully');

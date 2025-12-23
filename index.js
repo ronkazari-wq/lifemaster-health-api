@@ -439,14 +439,17 @@ app.get("/auth/withings/callback", async (req, res) => {
   }
 
   // Save tokens to persistent storage
-  const saved = await tokenStore.saveTokens(
+  const saveResult = await tokenStore.saveTokens(
     data.body.access_token,
     data.body.refresh_token,
     data.body.expires_in
   );
 
-  if (!saved) {
-    return res.status(500).json({ error: "Failed to save tokens" });
+  if (!saveResult.ok) {
+    return res.status(500).json({ 
+      error: "Failed to save tokens", 
+      details: saveResult 
+    });
   }
 
   res.json({
