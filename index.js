@@ -25,6 +25,12 @@ app.get('/health/daily', async (req, res) => {
     const dateStr = targetDate.toISODate();
     const startOfDay = targetDate.startOf('day');
     const endOfDay = startOfDay.plus({ days: 1 });
+    
+    // Wider window for measurements (3 days back to handle timezone/sync issues)
+    const measureStartTs = Math.floor(startOfDay.minus({ days: 3 }).toSeconds());
+    const measureEndTs = Math.floor(endOfDay.toSeconds());
+    
+    // Original window for sleep (using same day)
     const startTs = Math.floor(startOfDay.toSeconds());
     const endTs = Math.floor(endOfDay.toSeconds());
     
@@ -50,22 +56,36 @@ app.get('/health/daily', async (req, res) => {
     
     // Fetch measurements (weight, HR, SpO2, HRV, BP)
     let measureRes;
+    const measureUrl = 'https://wbsapi.withings.net/measure';
+    const measureParams = {
+      action: 'getmeas',
+      startdate: measureStartTs,
+      enddate: measureEndTs,
+      category: 1,
+      meastypes: '1,11,54,9,10,62'
+    };
+    
     try {
-      measureRes = await withingsClient.formPost(
-        'https://wbsapi.withings.net/measure',
-        {
-          action: 'getmeas',
-          startdate: startTs,
-          enddate: endTs,
-          category: 1,
-          meastypes: '1,11,54,9,10,62'
-        },
-        accessToken
-      );
+      if (debug) {
+        debugInfo.measure.url = measureUrl;
+        debugInfo.measure.action = measureParams.action;
+        debugInfo.measure.startdate = measureParams.startdate;
+        debugInfo.measure.enddate = measureParams.enddate;
+        debugInfo.measure.window_days = Math.ceil((measureEndTs - measureStartTs) / 86400);
+      }
+      
+      measureRes = await withingsClient.formPost(measureUrl, measureParams, accessToken);
       
       if (debug) {
         debugInfo.measure.status = measureRes.status;
-        debugInfo.measure.measuregrps_count = measureRes.body?.measuregrps?.length || 0;
+        debugInfo.measure.raw_measuregrps_count = measureRes.body?.measuregrps?.length || 0;
+        
+        if (measureRes.error || measureRes.body?.error) {
+          debugInfo.measure.error = measureRes.error || measureRes.body?.error;
+        }
+        if (measureRes.message || measureRes.body?.message) {
+          debugInfo.measure.message = measureRes.message || measureRes.body?.message;
+        }
         
         if (measureRes.body?.measuregrps && measureRes.body.measuregrps.length > 0) {
           debugInfo.measure.first_two_groups = measureRes.body.measuregrps.slice(0, 2).map(grp => ({
@@ -84,6 +104,12 @@ app.get('/health/daily', async (req, res) => {
       
       if (measureRes.status !== 0) {
         console.error('Withings measure API error:', measureRes);
+        if (debug) {
+          return res.status(502).json({ 
+            error: 'withings_api_error', 
+            debug: debugInfo
+          });
+        }
         return res.status(502).json({ error: 'withings_api_error', details: measureRes });
       }
       
@@ -149,20 +175,33 @@ app.get('/health/daily', async (req, res) => {
     
     // Fetch sleep data
     let sleepRes;
+    const sleepUrl = 'https://wbsapi.withings.net/v2/sleep';
+    const sleepParams = {
+      action: 'getsummary',
+      startdateymd: dateStr,
+      enddateymd: dateStr
+    };
+    
     try {
-      sleepRes = await withingsClient.formPost(
-        'https://wbsapi.withings.net/v2/sleep',
-        {
-          action: 'getsummary',
-          startdateymd: dateStr,
-          enddateymd: dateStr
-        },
-        accessToken
-      );
+      if (debug) {
+        debugInfo.sleep.url = sleepUrl;
+        debugInfo.sleep.action = sleepParams.action;
+        debugInfo.sleep.startdateymd = sleepParams.startdateymd;
+        debugInfo.sleep.enddateymd = sleepParams.enddateymd;
+      }
+      
+      sleepRes = await withingsClient.formPost(sleepUrl, sleepParams, accessToken);
       
       if (debug) {
         debugInfo.sleep.status = sleepRes.status;
-        debugInfo.sleep.series_count = sleepRes.body?.series?.length || 0;
+        debugInfo.sleep.raw_series_count = sleepRes.body?.series?.length || 0;
+        
+        if (sleepRes.error || sleepRes.body?.error) {
+          debugInfo.sleep.error = sleepRes.error || sleepRes.body?.error;
+        }
+        if (sleepRes.message || sleepRes.body?.message) {
+          debugInfo.sleep.message = sleepRes.message || sleepRes.body?.message;
+        }
         
         if (sleepRes.body?.series && sleepRes.body.series.length > 0) {
           const firstItem = sleepRes.body.series[0];
@@ -180,6 +219,9 @@ app.get('/health/daily', async (req, res) => {
       
       if (sleepRes.status !== 0) {
         console.warn('Withings sleep API error:', sleepRes);
+        if (debug) {
+          debugInfo.sleep.error_detected = true;
+        }
       } else if (sleepRes.body && sleepRes.body.series && sleepRes.body.series.length > 0) {
         // Find best overlapping sleep session
         let bestSleep = null;
@@ -241,7 +283,12 @@ app.get('/health/daily', async (req, res) => {
       window: {
         start_ts: startTs,
         end_ts: endTs,
-        timezone
+        timezone,
+        measure_window: {
+          start_ts: measureStartTs,
+          end_ts: measureEndTs,
+          days_back: 3
+        }
       },
       data_points: dataPoints,
       snapshot
