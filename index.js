@@ -63,6 +63,10 @@ paths:
 });
 
 app.get("/auth/withings/callback", async (req, res) => {
+  console.log("CALLBACK - Reached token exchange");
+  console.log("CALLBACK - CLIENT_ID present:", !!process.env.WITHINGS_CLIENT_ID);
+  console.log("CALLBACK - CLIENT_SECRET present:", !!process.env.WITHINGS_CLIENT_SECRET);
+  
   const code = req.query.code;
 
   if (!code) {
@@ -79,6 +83,11 @@ app.get("/auth/withings/callback", async (req, res) => {
     code,
     redirect_uri: "https://lifemaster-health-api.onrender.com/auth/withings/callback"
   });
+  
+  console.log("CALLBACK - Params include client_id:", params.has('client_id'));
+  console.log("CALLBACK - Params include client_secret:", params.has('client_secret'));
+  console.log("CALLBACK - Params include code:", params.has('code'));
+  console.log("CALLBACK - Params include redirect_uri:", params.has('redirect_uri'));
 
   const response = await fetch(tokenUrl, {
     method: "POST",
@@ -125,5 +134,7 @@ app.get("/auth/withings", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
+  console.log("ENV CHECK - CLIENT_ID:", !!process.env.WITHINGS_CLIENT_ID);
+  console.log("ENV CHECK - CLIENT_SECRET:", !!process.env.WITHINGS_CLIENT_SECRET);
 });
 
