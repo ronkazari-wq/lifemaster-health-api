@@ -62,8 +62,43 @@ paths:
 `);
 });
 
-app.get("/auth/withings/callback", (req, res) => {
-  res.status(200).send("Withings callback OK");
+app.get("/auth/withings/callback", async (req, res) => {
+  const code = req.query.code;
+
+  if (!code) {
+    return res.status(400).send("No authorization code received");
+  }
+
+  const tokenUrl = "https://wbsapi.withings.net/v2/oauth2";
+
+  const params = new URLSearchParams({
+    action: "requesttoken",
+    grant_type: "authorization_code",
+    client_id: process.env.WITHINGS_CLIENT_ID,
+    client_secret: process.env.WITHINGS_CLIENT_SECRET,
+    code,
+    redirect_uri: "https://lifemaster-health-api.onrender.com/auth/withings/callback"
+  });
+
+  const response = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params
+  });
+
+  const data = await response.json();
+
+  if (data.status !== 0) {
+    return res.status(500).json(data);
+  }
+
+  // זמני – רק לשלב הזה
+  res.json({
+    message: "OAuth success",
+    access_token: data.body.access_token,
+    refresh_token: data.body.refresh_token,
+    expires_in: data.body.expires_in
+  });
 });
 
 app.get("/auth/withings", (req, res) => {
