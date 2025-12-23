@@ -9,6 +9,7 @@ app.get('/health/daily', async (req, res) => {
   try {
     // Get date parameter or default to today in Asia/Jerusalem
     const dateParam = req.query.date;
+    const debug = req.query.debug === "1";
     const timezone = 'Asia/Jerusalem';
     
     let targetDate;
@@ -45,9 +46,12 @@ app.get('/health/daily', async (req, res) => {
       sleep_duration_minutes: null
     };
     
+    const debugInfo = debug ? { measure: {}, sleep: {} } : null;
+    
     // Fetch measurements (weight, HR, SpO2, HRV, BP)
+    let measureRes;
     try {
-      const measureData = await withingsClient.formPost(
+      measureRes = await withingsClient.formPost(
         'https://wbsapi.withings.net/measure',
         {
           action: 'getmeas',
@@ -59,16 +63,35 @@ app.get('/health/daily', async (req, res) => {
         accessToken
       );
       
-      if (measureData.status !== 0) {
-        console.error('Withings measure API error:', measureData);
-        return res.status(502).json({ error: 'withings_api_error', details: measureData });
+      if (debug) {
+        debugInfo.measure.status = measureRes.status;
+        debugInfo.measure.measuregrps_count = measureRes.body?.measuregrps?.length || 0;
+        
+        if (measureRes.body?.measuregrps && measureRes.body.measuregrps.length > 0) {
+          debugInfo.measure.first_two_groups = measureRes.body.measuregrps.slice(0, 2).map(grp => ({
+            date: grp.date,
+            category: grp.category,
+            deviceid: grp.deviceid,
+            measures: grp.measures.map(m => ({
+              type: m.type || m.meastype,
+              value: m.value,
+              unit: m.unit,
+              measure_keys: Object.keys(m)
+            }))
+          }));
+        }
+      }
+      
+      if (measureRes.status !== 0) {
+        console.error('Withings measure API error:', measureRes);
+        return res.status(502).json({ error: 'withings_api_error', details: measureRes });
       }
       
       // Parse measurements
-      if (measureData.body && measureData.body.measuregrps) {
+      if (measureRes.body && measureRes.body.measuregrps) {
         const latestValues = {};
         
-        for (const grp of measureData.body.measuregrps) {
+        for (const grp of measureRes.body.measuregrps) {
           for (const measure of grp.measures) {
             const meastype = measure.type;
             const actualValue = measure.value * Math.pow(10, measure.unit);
@@ -125,8 +148,9 @@ app.get('/health/daily', async (req, res) => {
     }
     
     // Fetch sleep data
+    let sleepRes;
     try {
-      const sleepData = await withingsClient.formPost(
+      sleepRes = await withingsClient.formPost(
         'https://wbsapi.withings.net/v2/sleep',
         {
           action: 'getsummary',
@@ -136,14 +160,32 @@ app.get('/health/daily', async (req, res) => {
         accessToken
       );
       
-      if (sleepData.status !== 0) {
-        console.warn('Withings sleep API error:', sleepData);
-      } else if (sleepData.body && sleepData.body.series && sleepData.body.series.length > 0) {
+      if (debug) {
+        debugInfo.sleep.status = sleepRes.status;
+        debugInfo.sleep.series_count = sleepRes.body?.series?.length || 0;
+        
+        if (sleepRes.body?.series && sleepRes.body.series.length > 0) {
+          const firstItem = sleepRes.body.series[0];
+          debugInfo.sleep.first_item_keys = Object.keys(firstItem);
+          debugInfo.sleep.first_item_data_keys = firstItem.data ? Object.keys(firstItem.data) : [];
+          debugInfo.sleep.first_item_sample = {
+            startdate: firstItem.startdate,
+            enddate: firstItem.enddate,
+            sleep_score: firstItem.data?.sleep_score,
+            total_sleep_time: firstItem.data?.total_sleep_time,
+            total_timeinbed: firstItem.data?.total_timeinbed
+          };
+        }
+      }
+      
+      if (sleepRes.status !== 0) {
+        console.warn('Withings sleep API error:', sleepRes);
+      } else if (sleepRes.body && sleepRes.body.series && sleepRes.body.series.length > 0) {
         // Find best overlapping sleep session
         let bestSleep = null;
         let maxOverlap = 0;
         
-        for (const session of sleepData.body.series) {
+        for (const session of sleepRes.body.series) {
           const sessionStart = session.startdate;
           const sessionEnd = session.enddate;
           
@@ -194,7 +236,7 @@ app.get('/health/daily', async (req, res) => {
     }
     
     // Return structured response
-    res.json({
+    const response = {
       date: dateStr,
       window: {
         start_ts: startTs,
@@ -203,7 +245,13 @@ app.get('/health/daily', async (req, res) => {
       },
       data_points: dataPoints,
       snapshot
-    });
+    };
+    
+    if (debug) {
+      response.debug = debugInfo;
+    }
+    
+    res.json(response);
     
   } catch (error) {
     console.error('Error in /health/daily:', error);
