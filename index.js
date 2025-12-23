@@ -1,5 +1,6 @@
 const express = require('express');
 const app = express();
+const tokenStore = require('./tokenStore');
 
 // GET endpoint at /health/daily
 app.get('/health/daily', (req, res) => {
@@ -101,11 +102,19 @@ app.get("/auth/withings/callback", async (req, res) => {
     return res.status(500).json(data);
   }
 
-  // זמני – רק לשלב הזה
+  // Save tokens to persistent storage
+  const saved = tokenStore.saveTokens(
+    data.body.access_token,
+    data.body.refresh_token,
+    data.body.expires_in
+  );
+
+  if (!saved) {
+    return res.status(500).json({ error: "Failed to save tokens" });
+  }
+
   res.json({
-    message: "OAuth success",
-    access_token: data.body.access_token,
-    refresh_token: data.body.refresh_token,
+    message: "OAuth success - tokens saved",
     expires_in: data.body.expires_in
   });
 });
