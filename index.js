@@ -392,7 +392,7 @@ app.get("/auth/withings/callback", async (req, res) => {
   }
 
   // Save tokens to persistent storage
-  const saved = tokenStore.saveTokens(
+  const saved = await tokenStore.saveTokens(
     data.body.access_token,
     data.body.refresh_token,
     data.body.expires_in
@@ -430,14 +430,14 @@ app.get("/auth/withings", (req, res) => {
 
 app.get("/withings/weight", async (req, res) => {
   // Load access token from storage
-  const tokens = tokenStore.getTokens();
+  const tokens = await tokenStore.getTokens();
   
   if (!tokens) {
     return res.status(401).json({ error: "No tokens found. Please authenticate first." });
   }
 
   // Check if token is expired
-  if (tokenStore.isTokenExpired()) {
+  if (await tokenStore.isTokenExpired()) {
     return res.status(401).json({ error: "Token expired. Re-authentication required." });
   }
 

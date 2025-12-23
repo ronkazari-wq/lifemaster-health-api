@@ -1,44 +1,62 @@
-const fs = require('fs');
-const path = require('path');
-
-const TOKEN_FILE = path.join(__dirname, 'tokens.json');
+const { supabase } = require('./supabaseClient');
 
 /**
- * Save Withings tokens to persistent storage
+ * Save Withings tokens to Supabase
  */
-function saveTokens(accessToken, refreshToken, expiresIn) {
-  const expiresAt = Date.now() + (expiresIn * 1000);
+async function saveTokens(accessToken, refreshToken, expiresIn) {
+  const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
   
-  const tokenData = {
-    access_token: accessToken,
-    refresh_token: refreshToken,
-    expires_at: expiresAt,
-    updated_at: new Date().toISOString()
-  };
-
   try {
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenData, null, 2), 'utf8');
-    console.log('Tokens saved successfully');
+    const { error } = await supabase
+      .from('withings_tokens')
+      .upsert({
+        id: 'main',
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        expires_at: expiresAt
+      });
+    
+    if (error) {
+      console.error('Error saving tokens to Supabase:', error.message);
+      return false;
+    }
+    
+    console.log('Tokens saved successfully to Supabase');
     return true;
   } catch (error) {
-    console.error('Error saving tokens:', error);
+    console.error('Error saving tokens:', error.message);
     return false;
   }
 }
 
 /**
- * Get stored Withings tokens
+ * Get stored Withings tokens from Supabase
  */
-function getTokens() {
+async function getTokens() {
   try {
-    if (!fs.existsSync(TOKEN_FILE)) {
+    const { data, error } = await supabase
+      .from('withings_tokens')
+      .select('access_token, refresh_token, expires_at')
+      .eq('id', 'main')
+      .maybeSingle();
+    
+    if (error) {
+      console.error('Error reading tokens from Supabase:', error.message);
       return null;
     }
     
-    const data = fs.readFileSync(TOKEN_FILE, 'utf8');
-    return JSON.parse(data);
+    if (!data) {
+      return null;
+    }
+    
+    // Convert expires_at from ISO string to timestamp for compatibility
+    return {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at: new Date(data.expires_at).getTime()
+    };
   } catch (error) {
-    console.error('Error reading tokens:', error);
+    console.error('Error reading tokens:', error.message);
     return null;
   }
 }
@@ -46,8 +64,8 @@ function getTokens() {
 /**
  * Check if the stored access token is expired
  */
-function isTokenExpired() {
-  const tokens = getTokens();
+async function isTokenExpired() {
+  const tokens = await getTokens();
   if (!tokens) return true;
   
   return Date.now() >= tokens.expires_at;
@@ -59,7 +77,7 @@ function isTokenExpired() {
  * @throws {Error} If no tokens found or refresh fails
  */
 async function getValidAccessToken() {
-  const tokens = getTokens();
+  const tokens = await getTokens();
   
   if (!tokens) {
     throw new Error('No tokens found. Please authenticate first.');
@@ -95,8 +113,8 @@ async function getValidAccessToken() {
       throw new Error(`Token refresh failed: ${JSON.stringify(data)}`);
     }
     
-    // Save new tokens
-    const saved = saveTokens(
+    // Save new tokens to Supabase
+    const saved = await saveTokens(
       data.body.access_token,
       data.body.refresh_token,
       data.body.expires_in
