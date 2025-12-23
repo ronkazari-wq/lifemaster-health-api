@@ -184,18 +184,19 @@ app.get("/withings/weight", async (req, res) => {
         return null;
       }
       
-      // Calculate actual weight value (value * 10^unit)
-      const weightKg = weightMeasure.value * Math.pow(10, weightMeasure.unit);
-      
+      // Return RAW fields for inspection
       return {
-        weight_kg: weightKg,
-        timestamp: group.date,
-        date: new Date(group.date * 1000).toISOString(),
+        value: weightMeasure.value,
+        unit: weightMeasure.unit,
+        date: group.date,
+        modified: group.modified || null,
+        deviceid: group.deviceid || null,
+        source: group.source || null,
         category: group.category
       };
     }).filter(m => m !== null);
 
-    // Return all measurements
+    // Return all measurements with raw fields
     res.json({
       count: measurements.length,
       measurements: measurements
