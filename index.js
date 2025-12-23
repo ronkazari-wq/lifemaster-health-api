@@ -169,27 +169,36 @@ app.get("/withings/weight", async (req, res) => {
       return res.status(500).json({ error: "Withings API error", details: data });
     }
 
-    // Extract latest weight measurement
+    // Extract weight measurements
     if (!data.body || !data.body.measuregrps || data.body.measuregrps.length === 0) {
       return res.status(404).json({ error: "No weight measurements found" });
     }
 
-    // Get the most recent measurement group
-    const latestGroup = data.body.measuregrps[0];
-    const weightMeasure = latestGroup.measures.find(m => m.type === 1);
+    // Get last 10 measurement groups (preserve Withings API order)
+    const measureGroups = data.body.measuregrps.slice(0, 10);
+    
+    const measurements = measureGroups.map(group => {
+      const weightMeasure = group.measures.find(m => m.type === 1);
+      
+      if (!weightMeasure) {
+        return null;
+      }
+      
+      // Calculate actual weight value (value * 10^unit)
+      const weightKg = weightMeasure.value * Math.pow(10, weightMeasure.unit);
+      
+      return {
+        weight_kg: weightKg,
+        timestamp: group.date,
+        date: new Date(group.date * 1000).toISOString(),
+        category: group.category
+      };
+    }).filter(m => m !== null);
 
-    if (!weightMeasure) {
-      return res.status(404).json({ error: "No weight data in latest measurement" });
-    }
-
-    // Calculate actual weight value (value * 10^unit)
-    const weightKg = weightMeasure.value * Math.pow(10, weightMeasure.unit);
-
-    // Return raw value only
+    // Return all measurements
     res.json({
-      weight_kg: weightKg,
-      timestamp: latestGroup.date,
-      date: new Date(latestGroup.date * 1000).toISOString()
+      count: measurements.length,
+      measurements: measurements
     });
 
   } catch (error) {
