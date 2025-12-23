@@ -13,8 +13,9 @@ async function saveTokens(accessToken, refreshToken, expiresIn) {
         id: 'main',
         access_token: accessToken,
         refresh_token: refreshToken,
-        expires_at: expiresAt
-      });
+        expires_at: expiresAt,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'id' });
     
     if (error) {
       console.error('Error saving tokens to Supabase:', error.message);
