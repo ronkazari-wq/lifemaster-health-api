@@ -18,7 +18,7 @@ app.get('/health/daily', (req, res) => {
 
 app.get('/openapi.yaml', (req, res) => {
   res.type('text/yaml').send(`
-openapi: 3.0.3
+openapi: 3.1.1
 info:
   title: LifeMaster Health API
   version: "1.0"
@@ -60,6 +60,10 @@ paths:
                   weight:
                     type: number
 `);
+});
+
+app.get("/auth/withings/callback", (req, res) => {
+  res.status(200).send("Withings callback OK");
 });
 
 // Start server on port from environment or default to 3000
