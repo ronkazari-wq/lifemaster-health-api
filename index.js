@@ -139,6 +139,65 @@ app.get("/auth/withings", (req, res) => {
   res.redirect(authUrl);
 });
 
+app.get("/withings/weight", async (req, res) => {
+  // Load access token from storage
+  const tokens = tokenStore.getTokens();
+  
+  if (!tokens) {
+    return res.status(401).json({ error: "No tokens found. Please authenticate first." });
+  }
+
+  // Check if token is expired
+  if (tokenStore.isTokenExpired()) {
+    return res.status(401).json({ error: "Token expired. Re-authentication required." });
+  }
+
+  // Call Withings measure API
+  const measureUrl = "https://wbsapi.withings.net/measure?action=getmeas&meastype=1&category=1&lastupdate=0";
+  
+  try {
+    const response = await fetch(measureUrl, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${tokens.access_token}`
+      }
+    });
+
+    const data = await response.json();
+
+    if (data.status !== 0) {
+      return res.status(500).json({ error: "Withings API error", details: data });
+    }
+
+    // Extract latest weight measurement
+    if (!data.body || !data.body.measuregrps || data.body.measuregrps.length === 0) {
+      return res.status(404).json({ error: "No weight measurements found" });
+    }
+
+    // Get the most recent measurement group
+    const latestGroup = data.body.measuregrps[0];
+    const weightMeasure = latestGroup.measures.find(m => m.type === 1);
+
+    if (!weightMeasure) {
+      return res.status(404).json({ error: "No weight data in latest measurement" });
+    }
+
+    // Calculate actual weight value (value * 10^unit)
+    const weightKg = weightMeasure.value * Math.pow(10, weightMeasure.unit);
+
+    // Return raw value only
+    res.json({
+      weight_kg: weightKg,
+      timestamp: latestGroup.date,
+      date: new Date(latestGroup.date * 1000).toISOString()
+    });
+
+  } catch (error) {
+    console.error("Error fetching weight:", error);
+    res.status(500).json({ error: "Failed to fetch weight data" });
+  }
+});
+
 // Start server on port from environment or default to 3000
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
