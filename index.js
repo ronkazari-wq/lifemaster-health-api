@@ -109,8 +109,7 @@ Output ONLY valid JSON:
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt }
       ],
-      response_format: { type: "json_object" },
-      temperature: 0.3
+      response_format: { type: "json_object" }
     });
 
     const analysis = JSON.parse(completion.choices[0].message.content);
