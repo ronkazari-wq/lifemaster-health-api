@@ -4,9 +4,17 @@ const tokenStore = require('./tokenStore');
 const withingsClient = require('./withingsClient');
 const { DateTime } = require('luxon');
 const { supabase } = require('./supabaseClient');
+const OpenAI = require('openai');
 
 // Middleware to parse JSON request bodies
 app.use(express.json());
+
+// OpenAI configuration
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";
+const AGENT_API_BASE = process.env.AGENT_API_BASE || "https://lifemaster-health-api.onrender.com";
 
 // GET endpoint at /health/daily - Real Withings data
 app.get('/health/daily', async (req, res) => {
@@ -623,6 +631,269 @@ app.post("/agent/commit", async (req, res) => {
     status: "committed",
     entry: data
   });
+});
+
+// POST /agent/chat - OpenAI-powered agent with tool calling
+app.post("/agent/chat", async (req, res) => {
+  try {
+    const { message } = req.body;
+    
+    if (!message) {
+      return res.status(400).json({ error: "Message is required" });
+    }
+
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OPENAI_API_KEY not configured" });
+    }
+
+    // Check for explicit consent words in Hebrew
+    const hasConsent = /מאשר|תעדכן|בצע/.test(message);
+
+    // Store incoming message as event
+    const today = DateTime.now().setZone('Asia/Jerusalem').toISODate();
+    await supabase.from("lifemaster_progress").insert({
+      entry_type: "event",
+      entry_date: today,
+      source: "manual",
+      title: "User message",
+      notes: message,
+      entry_ts: new Date().toISOString()
+    });
+
+    // Define tools for OpenAI function calling
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "get_agent_state",
+          description: "Retrieve recent progress entries from the lifemaster_progress table. Returns up to 100 recent entries ordered by timestamp descending.",
+          parameters: {
+            type: "object",
+            properties: {},
+            required: []
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "create_agent_event",
+          description: "Record a manual event (nutrition, sleep, training observation, or user note) to the progress log.",
+          parameters: {
+            type: "object",
+            properties: {
+              entry_date: {
+                type: "string",
+                description: "Date in YYYY-MM-DD format"
+              },
+              title: {
+                type: "string",
+                description: "Brief title of the event"
+              },
+              notes: {
+                type: "string",
+                description: "Detailed notes or observations"
+              },
+              metrics: {
+                type: "object",
+                description: "Optional structured metrics (e.g., sleep_hours, calories, etc.)"
+              }
+            },
+            required: ["entry_date", "title"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "commit_agent_decision",
+          description: "Commit an agent decision or intervention. ONLY call this if explicit consent was granted by the user (words like 'מאשר', 'תעדכן', 'בצע').",
+          parameters: {
+            type: "object",
+            properties: {
+              entry_date: {
+                type: "string",
+                description: "Date in YYYY-MM-DD format"
+              },
+              title: {
+                type: "string",
+                description: "Decision title"
+              },
+              analysis: {
+                type: "object",
+                description: "Analysis object with worked, didnt_work, and next fields"
+              },
+              consent: {
+                type: "object",
+                description: "Consent object with status='granted', granted_at timestamp, and scope",
+                properties: {
+                  status: { type: "string" },
+                  granted_at: { type: "string" },
+                  scope: { type: "string" }
+                },
+                required: ["status", "granted_at", "scope"]
+              }
+            },
+            required: ["entry_date", "title", "consent"]
+          }
+        }
+      }
+    ];
+
+    // System prompt for the agent
+    const systemPrompt = `You are a professional health and fitness coach assistant for the LifeMaster system.
+
+Your role:
+- Analyze user health data (sleep, weight, HRV, training adherence)
+- Provide evidence-based guidance focused on sustainability
+- Prioritize sleep, recovery, and adherence over aggressive optimization
+- Never suggest extreme interventions
+
+CRITICAL RULES:
+1. Read TRUTH_STATE.md principles: no extreme diets, prioritize adherence and recovery
+2. NEVER call commit_agent_decision unless the user explicitly gave consent with words: "מאשר", "תעדכן", or "בצע"
+3. If proposing changes without consent, explain the plan and ASK for explicit approval
+4. Always call get_agent_state first to understand current context
+5. Log observations using create_agent_event when appropriate
+
+Current consent status: ${hasConsent ? "GRANTED - you may commit decisions" : "NOT GRANTED - only propose, do not commit"}
+
+Respond in Hebrew (עברית) with professional, clear language.`;
+
+    const toolTrace = [];
+    let assistantReply = "";
+    let committed = false;
+
+    // Initial OpenAI call
+    const messages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: message }
+    ];
+
+    let response = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      messages: messages,
+      tools: tools,
+      tool_choice: "auto"
+    });
+
+    let responseMessage = response.choices[0].message;
+    messages.push(responseMessage);
+
+    // Handle tool calls (max 5 iterations to prevent infinite loops)
+    let iteration = 0;
+    const MAX_ITERATIONS = 5;
+
+    while (responseMessage.tool_calls && iteration < MAX_ITERATIONS) {
+      iteration++;
+
+      for (const toolCall of responseMessage.tool_calls) {
+        const functionName = toolCall.function.name;
+        const functionArgs = JSON.parse(toolCall.function.arguments);
+
+        toolTrace.push({
+          function: functionName,
+          arguments: functionArgs
+        });
+
+        let functionResult;
+
+        try {
+          if (functionName === "get_agent_state") {
+            // Call GET /agent/state
+            const stateResponse = await fetch(`${AGENT_API_BASE}/agent/state`);
+            functionResult = await stateResponse.json();
+
+          } else if (functionName === "create_agent_event") {
+            // Call POST /agent/event
+            const eventPayload = {
+              entry_type: "event",
+              entry_date: functionArgs.entry_date,
+              source: "agent",
+              title: functionArgs.title,
+              notes: functionArgs.notes,
+              metrics: functionArgs.metrics || {}
+            };
+
+            const eventResponse = await fetch(`${AGENT_API_BASE}/agent/event`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(eventPayload)
+            });
+            functionResult = await eventResponse.json();
+
+          } else if (functionName === "commit_agent_decision") {
+            // Only allow if consent was granted
+            if (!hasConsent) {
+              functionResult = {
+                error: "Consent not granted. User must explicitly approve with 'מאשר', 'תעדכן', or 'בצע'."
+              };
+            } else {
+              // Call POST /agent/commit
+              const commitPayload = {
+                entry_type: "decision",
+                entry_date: functionArgs.entry_date,
+                source: "agent",
+                title: functionArgs.title,
+                analysis: functionArgs.analysis,
+                consent: {
+                  status: "granted",
+                  granted_at: new Date().toISOString(),
+                  scope: functionArgs.consent.scope
+                }
+              };
+
+              const commitResponse = await fetch(`${AGENT_API_BASE}/agent/commit`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(commitPayload)
+              });
+              functionResult = await commitResponse.json();
+              
+              if (functionResult.status === "committed") {
+                committed = true;
+              }
+            }
+          }
+        } catch (error) {
+          functionResult = { error: error.message };
+        }
+
+        // Add tool result to messages
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(functionResult)
+        });
+      }
+
+      // Get next response from OpenAI
+      response = await openai.chat.completions.create({
+        model: OPENAI_MODEL,
+        messages: messages,
+        tools: tools,
+        tool_choice: "auto"
+      });
+
+      responseMessage = response.choices[0].message;
+      messages.push(responseMessage);
+    }
+
+    assistantReply = responseMessage.content || "No response generated";
+
+    res.json({
+      reply: assistantReply,
+      committed: committed,
+      tool_trace: toolTrace
+    });
+
+  } catch (error) {
+    console.error("Error in /agent/chat:", error);
+    res.status(500).json({
+      error: "Agent chat failed",
+      details: error.message
+    });
+  }
 });
 
 // Start server on port from environment or default to 3000

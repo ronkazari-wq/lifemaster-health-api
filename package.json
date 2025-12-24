@@ -13,6 +13,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.89.0",
     "express": "^5.2.1",
-    "luxon": "^3.4.4"
+    "luxon": "^3.4.4",
+    "openai": "^4.77.3"
   }
 }
