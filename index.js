@@ -3,6 +3,10 @@ const app = express();
 const tokenStore = require('./tokenStore');
 const withingsClient = require('./withingsClient');
 const { DateTime } = require('luxon');
+const { supabase } = require('./supabaseClient');
+
+// Middleware to parse JSON request bodies
+app.use(express.json());
 
 // GET endpoint at /health/daily - Real Withings data
 app.get('/health/daily', async (req, res) => {
@@ -545,6 +549,80 @@ app.get("/withings/weight", async (req, res) => {
     console.error("Error fetching weight:", error);
     res.status(500).json({ error: "Failed to fetch weight data" });
   }
+});
+
+// ===== AGENT PROGRESS ENDPOINTS =====
+
+// GET /agent/state - Read recent progress entries
+app.get("/agent/state", async (req, res) => {
+  const { data, error } = await supabase
+    .from("lifemaster_progress")
+    .select("*")
+    .order("entry_ts", { ascending: false })
+    .limit(100);
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  res.json({
+    count: data.length,
+    entries: data
+  });
+});
+
+// POST /agent/event - Write manual events
+app.post("/agent/event", async (req, res) => {
+  const payload = {
+    ...req.body,
+    entry_ts: new Date().toISOString()
+  };
+
+  const { data, error } = await supabase
+    .from("lifemaster_progress")
+    .insert(payload)
+    .select()
+    .single();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  res.json({
+    status: "saved",
+    entry: data
+  });
+});
+
+// POST /agent/commit - Write agent decisions (requires consent)
+app.post("/agent/commit", async (req, res) => {
+  const { consent } = req.body;
+
+  if (!consent || consent.status !== "granted") {
+    return res.status(403).json({
+      error: "Consent not granted"
+    });
+  }
+
+  const payload = {
+    ...req.body,
+    entry_ts: new Date().toISOString()
+  };
+
+  const { data, error } = await supabase
+    .from("lifemaster_progress")
+    .insert(payload)
+    .select()
+    .single();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  res.json({
+    status: "committed",
+    entry: data
+  });
 });
 
 // Start server on port from environment or default to 3000
