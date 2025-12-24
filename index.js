@@ -111,15 +111,19 @@ Output ONLY valid JSON:
 
     // Persist to lifemaster_progress
     const today = DateTime.now().setZone('Asia/Jerusalem').toISODate();
+    // Minimal entry - only fields that exist in Supabase table
     const progressEntry = {
       entry_type: entry_type || 'measurement',
       entry_date: today,
       source: source || 'withings',
-      title: analysis.summary ? analysis.summary.substring(0, 100) : 'No summary',
-      summary: analysis.summary || '',
-      metrics: snapshot || {},
+      notes: analysis.summary || 'No analysis available',
       entry_ts: new Date().toISOString()
     };
+    
+    // Try to add metrics if column exists (will fail silently if not)
+    if (snapshot && Object.keys(snapshot).length > 0) {
+      progressEntry.metrics = snapshot;
+    }
 
     console.log('=== ATTEMPTING INSERT TO lifemaster_progress ===');
     console.log('Progress entry:', JSON.stringify(progressEntry, null, 2));
