@@ -23,27 +23,31 @@ const AGENT_API_BASE = process.env.AGENT_API_BASE || "https://lifemaster-health-
  * Called by /health/daily (on significant change) and /agent/chat (always)
  */
 async function analyze_and_persist_progress(input) {
-  try {
-    const { snapshot, source, entry_type, user_message } = input;
-    
-    if (!process.env.OPENAI_API_KEY) {
-      console.warn('OPENAI_API_KEY not set, skipping progress analysis');
-      return { success: false, reason: 'OpenAI not configured' };
-    }
+  const { snapshot, source, entry_type, user_message } = input;
+  
+  console.log('=== ANALYZE_AND_PERSIST_PROGRESS START ===');
+  console.log('Input:', { source, entry_type, has_snapshot: !!snapshot, has_message: !!user_message });
+  
+  if (!process.env.OPENAI_API_KEY) {
+    console.error('CRITICAL: OPENAI_API_KEY not set');
+    throw new Error('OPENAI_API_KEY is required for progress analysis');
+  }
 
-    // Read last 30 days from lifemaster_progress
-    const thirtyDaysAgo = DateTime.now().setZone('Asia/Jerusalem').minus({ days: 30 }).toISODate();
-    const { data: recentHistory, error: historyError } = await supabase
-      .from('lifemaster_progress')
-      .select('*')
-      .gte('entry_date', thirtyDaysAgo)
-      .order('entry_ts', { ascending: false })
-      .limit(50);
+  // Read last 30 days from lifemaster_progress
+  const thirtyDaysAgo = DateTime.now().setZone('Asia/Jerusalem').minus({ days: 30 }).toISODate();
+  const { data: recentHistory, error: historyError } = await supabase
+    .from('lifemaster_progress')
+    .select('*')
+    .gte('entry_date', thirtyDaysAgo)
+    .order('entry_ts', { ascending: false })
+    .limit(50);
 
-    if (historyError) {
-      console.error('Error fetching history:', historyError);
-      return { success: false, reason: historyError.message };
-    }
+  if (historyError) {
+    console.error('ERROR fetching history from Supabase:', historyError);
+    throw new Error(`Failed to fetch history: ${historyError.message}`);
+  }
+  
+  console.log(`Fetched ${recentHistory?.length || 0} history entries`);
 
     // Read TRUTH_STATE for context (inline summary)
     const truthContext = {
@@ -96,6 +100,8 @@ Output ONLY valid JSON:
       ? `User message: "${user_message}"\n\nCurrent snapshot: ${JSON.stringify(snapshot)}\n\nRecent history: ${JSON.stringify(recentHistory.slice(0, 5))}`
       : `Current snapshot: ${JSON.stringify(snapshot)}\n\nRecent history: ${JSON.stringify(recentHistory.slice(0, 5))}`;
 
+    console.log('Calling OpenAI with model:', OPENAI_MODEL);
+    
     // Call OpenAI (ONE call only)
     const completion = await openai.chat.completions.create({
       model: OPENAI_MODEL,
@@ -108,6 +114,11 @@ Output ONLY valid JSON:
     });
 
     const analysis = JSON.parse(completion.choices[0].message.content);
+    console.log('OpenAI analysis received:', { 
+      impact: analysis.impact_assessment, 
+      confidence: analysis.confidence,
+      summary_length: analysis.summary?.length || 0
+    });
 
     // Persist to lifemaster_progress
     const today = DateTime.now().setZone('Asia/Jerusalem').toISODate();
@@ -115,14 +126,17 @@ Output ONLY valid JSON:
       entry_type: entry_type || 'measurement',
       entry_date: today,
       source: source || 'withings',
-      title: analysis.summary.substring(0, 100),
-      summary: analysis.summary,
+      title: analysis.summary ? analysis.summary.substring(0, 100) : 'No summary',
+      summary: analysis.summary || '',
       impact_assessment: analysis.impact_assessment,
       confidence: analysis.confidence || 'medium',
-      metrics: snapshot,
-      delta_vs_baseline: analysis.delta_vs_baseline,
+      metrics: snapshot || {},
+      delta_vs_baseline: analysis.delta_vs_baseline || {},
       entry_ts: new Date().toISOString()
     };
+
+    console.log('=== ATTEMPTING INSERT TO lifemaster_progress ===');
+    console.log('Progress entry:', JSON.stringify(progressEntry, null, 2));
 
     const { data: savedEntry, error: saveError } = await supabase
       .from('lifemaster_progress')
@@ -130,21 +144,22 @@ Output ONLY valid JSON:
       .select()
       .single();
 
+    console.log('PROGRESS INSERT RESULT:', { data: savedEntry, error: saveError });
+
     if (saveError) {
-      console.error('Error saving progress:', saveError);
-      return { success: false, reason: saveError.message };
+      console.error('PROGRESS INSERT ERROR:', saveError);
+      console.error('Full error details:', JSON.stringify(saveError, null, 2));
+      throw new Error(`Failed to insert progress: ${saveError.message} (code: ${saveError.code})`);
     }
+
+    console.log('✓ Progress saved successfully. Entry ID:', savedEntry?.id);
+    console.log('=== ANALYZE_AND_PERSIST_PROGRESS END ===');
 
     return {
       success: true,
       entry: savedEntry,
       analysis
     };
-
-  } catch (error) {
-    console.error('Error in analyze_and_persist_progress:', error);
-    return { success: false, reason: error.message };
-  }
 }
 
 // ===== ENDPOINTS =====
@@ -314,8 +329,10 @@ app.get('/health/daily', async (req, res) => {
         }
       }
     } catch (error) {
-      console.error('Error fetching measurements:', error);
-      return res.status(502).json({ error: 'withings_measure_failed', message: error.message });
+      console.error('⚠️ Error fetching measurements from Withings:', error.message);
+      console.error('Continuing with empty snapshot - Withings is data source, not blocker');
+      // Don't fail the request - continue with empty measurements
+      measureRes = { status: -1, body: { measuregrps: [] }, error: error.message };
     }
     
     // Fetch sleep data
@@ -418,7 +435,8 @@ app.get('/health/daily', async (req, res) => {
         }
       }
     } catch (error) {
-      console.error('Error fetching sleep:', error);
+      console.error('⚠️ Error fetching sleep from Withings:', error.message);
+      console.error('Continuing with empty sleep data - Withings is data source, not blocker');
       // Don't fail the entire request for sleep data
     }
     
@@ -1089,6 +1107,10 @@ Respond in Hebrew (עברית) with professional, clear language.`;
       chatEntryType = 'intervention';
     }
 
+    console.log('=== /agent/chat PROGRESS TRIGGER ===');
+    console.log('Message:', message.substring(0, 50));
+    console.log('Detected entry_type:', chatEntryType);
+
     // Get current snapshot from recent progress data
     const { data: recentMetrics } = await supabase
       .from('lifemaster_progress')
@@ -1101,22 +1123,19 @@ Respond in Hebrew (עברית) with professional, clear language.`;
       ? recentMetrics[0].metrics 
       : { weight_kg: null, heart_pulse_bpm: null, hrv: null, sleep_duration_minutes: null };
 
-    // Always call analyze_and_persist_progress for user chat
-    try {
-      const chatAnalysis = await analyze_and_persist_progress({
-        snapshot: currentSnapshot,
-        source: 'user',
-        entry_type: chatEntryType,
-        user_message: message
-      });
+    console.log('Current snapshot:', currentSnapshot);
 
-      if (chatAnalysis.success) {
-        console.log('Chat analysis persisted:', chatAnalysis.entry.id);
-      }
-    } catch (chatAnalysisError) {
-      console.error('Error in chat analysis:', chatAnalysisError);
-      // Don't fail the chat response if analysis fails
-    }
+    // Always call analyze_and_persist_progress for user chat
+    // NO SILENT FAILURES - throw errors up
+    const chatAnalysis = await analyze_and_persist_progress({
+      snapshot: currentSnapshot,
+      source: 'user',
+      entry_type: chatEntryType,
+      user_message: message
+    });
+
+    console.log('✓ Chat analysis completed and persisted');
+    console.log('Entry ID:', chatAnalysis.entry?.id);
 
     res.json({
       reply: assistantReply,
