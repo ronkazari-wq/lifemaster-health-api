@@ -472,7 +472,7 @@ app.get("/auth/withings", (req, res) => {
     `?response_type=code` +
     `&client_id=${clientId}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&scope=user.info,user.metrics,user.activity,user.sleeppro` +
+    `&scope=user.info,user.metrics,user.activity` +
     `&state=lifemaster`;
 
   res.redirect(authUrl);
