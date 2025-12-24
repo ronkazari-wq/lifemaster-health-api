@@ -92,8 +92,7 @@ Output ONLY valid JSON:
     "resting_hr_bpm": number or null,
     "hrv_ms": number or null,
     "sleep_duration_min": number or null
-  },
-  "confidence": "low|medium|high"
+  }
 }`;
 
     const userPrompt = source === 'user' && user_message
@@ -114,8 +113,7 @@ Output ONLY valid JSON:
 
     const analysis = JSON.parse(completion.choices[0].message.content);
     console.log('OpenAI analysis received:', { 
-      impact: analysis.impact_assessment, 
-      confidence: analysis.confidence,
+      impact: analysis.impact_assessment,
       summary_length: analysis.summary?.length || 0
     });
 
@@ -128,7 +126,6 @@ Output ONLY valid JSON:
       title: analysis.summary ? analysis.summary.substring(0, 100) : 'No summary',
       summary: analysis.summary || '',
       impact_assessment: analysis.impact_assessment,
-      confidence: analysis.confidence || 'medium',
       metrics: snapshot || {},
       delta_vs_baseline: analysis.delta_vs_baseline || {},
       entry_ts: new Date().toISOString()
