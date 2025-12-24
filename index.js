@@ -16,6 +16,139 @@ const openai = new OpenAI({
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";
 const AGENT_API_BASE = process.env.AGENT_API_BASE || "https://lifemaster-health-api.onrender.com";
 
+// ===== PROGRESS AGENT CORE FUNCTION =====
+
+/**
+ * Analyze current health data and persist progress assessment
+ * Called by /health/daily (on significant change) and /agent/chat (always)
+ */
+async function analyze_and_persist_progress(input) {
+  try {
+    const { snapshot, source, entry_type, user_message } = input;
+    
+    if (!process.env.OPENAI_API_KEY) {
+      console.warn('OPENAI_API_KEY not set, skipping progress analysis');
+      return { success: false, reason: 'OpenAI not configured' };
+    }
+
+    // Read last 30 days from lifemaster_progress
+    const thirtyDaysAgo = DateTime.now().setZone('Asia/Jerusalem').minus({ days: 30 }).toISODate();
+    const { data: recentHistory, error: historyError } = await supabase
+      .from('lifemaster_progress')
+      .select('*')
+      .gte('entry_date', thirtyDaysAgo)
+      .order('entry_ts', { ascending: false })
+      .limit(50);
+
+    if (historyError) {
+      console.error('Error fetching history:', historyError);
+      return { success: false, reason: historyError.message };
+    }
+
+    // Read TRUTH_STATE for context (inline summary)
+    const truthContext = {
+      baseline: {
+        weight_kg: 63.1,
+        resting_hr: 85,
+        hrv_ms: 57,
+        sleep_score: 48,
+        sleep_duration_minutes: 345
+      },
+      goals: {
+        primary: "Body recomposition with visible abs, no weight loss target",
+        secondary: ["Reduce triglycerides", "Improve sleep", "Lower RHR", "Build training habit"]
+      },
+      constraints: {
+        medical: ["Cervical/lumbar disc herniation"],
+        training: "2x30min/week",
+        lifestyle: "Poor sleep 5h45m, evening stress"
+      }
+    };
+
+    // Build prompt for OpenAI
+    const systemPrompt = `You are a clinical health analyst for LifeMaster.
+
+Context:
+- 48.9yo male, 172cm, baseline: 63.1kg, RHR 85bpm, HRV 57ms, Sleep 5h45m
+- Goals: Body recomposition, improve sleep, lower RHR, reduce triglycerides
+- Constraints: Disc herniation, 2x30min training/week, poor sleep
+
+Rules:
+- Prioritize sleep and recovery over all else
+- Weight changes secondary to body composition
+- No extreme recommendations
+- Focus on sustainability
+
+Output ONLY valid JSON:
+{
+  "summary": "2-3 sentence assessment in Hebrew",
+  "impact_assessment": "positive|neutral|negative",
+  "delta_vs_baseline": {
+    "weight_kg": number or null,
+    "resting_hr_bpm": number or null,
+    "hrv_ms": number or null,
+    "sleep_duration_min": number or null
+  },
+  "confidence": "low|medium|high"
+}`;
+
+    const userPrompt = source === 'user' && user_message
+      ? `User message: "${user_message}"\n\nCurrent snapshot: ${JSON.stringify(snapshot)}\n\nRecent history: ${JSON.stringify(recentHistory.slice(0, 5))}`
+      : `Current snapshot: ${JSON.stringify(snapshot)}\n\nRecent history: ${JSON.stringify(recentHistory.slice(0, 5))}`;
+
+    // Call OpenAI (ONE call only)
+    const completion = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.3
+    });
+
+    const analysis = JSON.parse(completion.choices[0].message.content);
+
+    // Persist to lifemaster_progress
+    const today = DateTime.now().setZone('Asia/Jerusalem').toISODate();
+    const progressEntry = {
+      entry_type: entry_type || 'measurement',
+      entry_date: today,
+      source: source || 'withings',
+      title: analysis.summary.substring(0, 100),
+      summary: analysis.summary,
+      impact_assessment: analysis.impact_assessment,
+      confidence: analysis.confidence || 'medium',
+      metrics: snapshot,
+      delta_vs_baseline: analysis.delta_vs_baseline,
+      entry_ts: new Date().toISOString()
+    };
+
+    const { data: savedEntry, error: saveError } = await supabase
+      .from('lifemaster_progress')
+      .insert(progressEntry)
+      .select()
+      .single();
+
+    if (saveError) {
+      console.error('Error saving progress:', saveError);
+      return { success: false, reason: saveError.message };
+    }
+
+    return {
+      success: true,
+      entry: savedEntry,
+      analysis
+    };
+
+  } catch (error) {
+    console.error('Error in analyze_and_persist_progress:', error);
+    return { success: false, reason: error.message };
+  }
+}
+
+// ===== ENDPOINTS =====
+
 // GET endpoint at /health/daily - Real Withings data
 app.get('/health/daily', async (req, res) => {
   try {
@@ -308,6 +441,70 @@ app.get('/health/daily', async (req, res) => {
     
     if (debug) {
       response.debug = debugInfo;
+    }
+    
+    // ===== TRIGGER PROGRESS AGENT ON SIGNIFICANT CHANGE =====
+    // Check if there's a significant change compared to recent measurements
+    try {
+      const { data: recentMeasurements } = await supabase
+        .from('lifemaster_progress')
+        .select('metrics')
+        .eq('source', 'withings')
+        .eq('entry_type', 'measurement')
+        .order('entry_ts', { ascending: false })
+        .limit(1);
+
+      let shouldTriggerAgent = false;
+      
+      if (!recentMeasurements || recentMeasurements.length === 0) {
+        // No previous measurement, this is the first one
+        shouldTriggerAgent = true;
+      } else {
+        const lastMetrics = recentMeasurements[0].metrics;
+        
+        // Check for significant changes
+        const changes = {
+          weight: snapshot.weight_kg && lastMetrics.weight_kg 
+            ? Math.abs(snapshot.weight_kg - lastMetrics.weight_kg) 
+            : 0,
+          rhr: snapshot.heart_pulse_bpm && lastMetrics.heart_pulse_bpm
+            ? Math.abs(snapshot.heart_pulse_bpm - lastMetrics.heart_pulse_bpm)
+            : 0,
+          hrv: snapshot.hrv && lastMetrics.hrv
+            ? Math.abs((snapshot.hrv - lastMetrics.hrv) / lastMetrics.hrv * 100)
+            : 0,
+          sleep: snapshot.sleep_duration_minutes && lastMetrics.sleep_duration_minutes
+            ? Math.abs(snapshot.sleep_duration_minutes - lastMetrics.sleep_duration_minutes)
+            : 0
+        };
+
+        // Thresholds: weight ≥0.5kg, RHR ≥5bpm, HRV ≥10%, sleep ≥60min
+        shouldTriggerAgent = 
+          changes.weight >= 0.5 ||
+          changes.rhr >= 5 ||
+          changes.hrv >= 10 ||
+          changes.sleep >= 60;
+
+        if (debug && shouldTriggerAgent) {
+          response.agent_trigger = { reason: 'significant_change', changes };
+        }
+      }
+
+      // Trigger agent analysis if significant change detected
+      if (shouldTriggerAgent) {
+        const agentResult = await analyze_and_persist_progress({
+          snapshot,
+          source: 'withings',
+          entry_type: 'measurement'
+        });
+        
+        if (debug && agentResult.success) {
+          response.agent_analysis = agentResult.analysis;
+        }
+      }
+    } catch (agentError) {
+      console.error('Error in agent trigger logic:', agentError);
+      // Don't fail the request if agent fails
     }
     
     res.json(response);
@@ -880,6 +1077,46 @@ Respond in Hebrew (עברית) with professional, clear language.`;
     }
 
     assistantReply = responseMessage.content || "No response generated";
+
+    // ===== ALWAYS TRIGGER PROGRESS ANALYSIS ON USER CHAT =====
+    // Determine entry_type based on message content
+    let chatEntryType = 'insight'; // default
+    if (/אכלתי|אוכל|תזונה|ארוחה|סנדוויץ|פחמימות|חלבון/.test(message)) {
+      chatEntryType = 'adherence';
+    } else if (/אימון|התאמן|כוח|קרדיו|שרירים/.test(message)) {
+      chatEntryType = 'adherence';
+    } else if (/מתחיל|אתחיל|אשנה|אפסיק/.test(message)) {
+      chatEntryType = 'intervention';
+    }
+
+    // Get current snapshot from recent progress data
+    const { data: recentMetrics } = await supabase
+      .from('lifemaster_progress')
+      .select('metrics')
+      .not('metrics', 'is', null)
+      .order('entry_ts', { ascending: false })
+      .limit(1);
+
+    const currentSnapshot = recentMetrics && recentMetrics.length > 0 
+      ? recentMetrics[0].metrics 
+      : { weight_kg: null, heart_pulse_bpm: null, hrv: null, sleep_duration_minutes: null };
+
+    // Always call analyze_and_persist_progress for user chat
+    try {
+      const chatAnalysis = await analyze_and_persist_progress({
+        snapshot: currentSnapshot,
+        source: 'user',
+        entry_type: chatEntryType,
+        user_message: message
+      });
+
+      if (chatAnalysis.success) {
+        console.log('Chat analysis persisted:', chatAnalysis.entry.id);
+      }
+    } catch (chatAnalysisError) {
+      console.error('Error in chat analysis:', chatAnalysisError);
+      // Don't fail the chat response if analysis fails
+    }
 
     res.json({
       reply: assistantReply,
