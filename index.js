@@ -85,8 +85,7 @@ Rules:
 
 Output ONLY valid JSON:
 {
-  "summary": "2-3 sentence assessment in Hebrew",
-  "impact_assessment": "positive|neutral|negative"
+  "summary": "2-3 sentence assessment in Hebrew"
 }`;
 
     const userPrompt = source === 'user' && user_message
@@ -107,7 +106,6 @@ Output ONLY valid JSON:
 
     const analysis = JSON.parse(completion.choices[0].message.content);
     console.log('OpenAI analysis received:', { 
-      impact: analysis.impact_assessment,
       summary_length: analysis.summary?.length || 0
     });
 
@@ -119,7 +117,6 @@ Output ONLY valid JSON:
       source: source || 'withings',
       title: analysis.summary ? analysis.summary.substring(0, 100) : 'No summary',
       summary: analysis.summary || '',
-      impact_assessment: analysis.impact_assessment,
       metrics: snapshot || {},
       entry_ts: new Date().toISOString()
     };
