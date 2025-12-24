@@ -86,13 +86,7 @@ Rules:
 Output ONLY valid JSON:
 {
   "summary": "2-3 sentence assessment in Hebrew",
-  "impact_assessment": "positive|neutral|negative",
-  "delta_vs_baseline": {
-    "weight_kg": number or null,
-    "resting_hr_bpm": number or null,
-    "hrv_ms": number or null,
-    "sleep_duration_min": number or null
-  }
+  "impact_assessment": "positive|neutral|negative"
 }`;
 
     const userPrompt = source === 'user' && user_message
@@ -127,7 +121,6 @@ Output ONLY valid JSON:
       summary: analysis.summary || '',
       impact_assessment: analysis.impact_assessment,
       metrics: snapshot || {},
-      delta_vs_baseline: analysis.delta_vs_baseline || {},
       entry_ts: new Date().toISOString()
     };
 
