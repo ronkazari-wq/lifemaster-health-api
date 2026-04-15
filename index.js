@@ -1,3 +1,5 @@
+require('dotenv').config();
+console.log('ENV CHECK - ANTHROPIC_API_KEY:', !!process.env.ANTHROPIC_API_KEY);
 const express = require('express');
 const app = express();
 const tokenStore = require('./tokenStore');
@@ -5,9 +7,21 @@ const withingsClient = require('./withingsClient');
 const { DateTime } = require('luxon');
 const { supabase } = require('./supabaseClient');
 const OpenAI = require('openai');
+const Anthropic = require('@anthropic-ai/sdk');
+const cron = require('node-cron');
+// Anthropic Managed Agents
+const { getAgentConfig } = require('./anthropic-setup');
+const { syncAllUsers } = require('./withings-sync');
+const sessionManager = require('./session-manager');
+const agentEvents = require('./agent-events');
+const { sendLunchEvent, sendDinnerEvent } = agentEvents;
+const consumerPool = require('./consumer-pool');
+const SessionConsumer = require('./session-consumer');
 
 // Middleware to parse JSON request bodies
 app.use(express.json());
+// Twilio sends form-encoded bodies
+app.use(express.urlencoded({ extended: false }));
 
 // OpenAI configuration
 const openai = new OpenAI({
@@ -16,510 +30,72 @@ const openai = new OpenAI({
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";
 const AGENT_API_BASE = process.env.AGENT_API_BASE || "https://lifemaster-health-api.onrender.com";
 
-// ===== PROGRESS AGENT CORE FUNCTION =====
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ===== DATABASE HELPERS =====
 
 /**
- * Analyze current health data and persist progress assessment
- * Called by /health/daily (on significant change) and /agent/chat (always)
+ * Fetch a user's full health identity and metrics from Supabase
  */
-async function analyze_and_persist_progress(input) {
-  const { snapshot, source, entry_type, user_message } = input;
-  
-  console.log('=== ANALYZE_AND_PERSIST_PROGRESS START ===');
-  console.log('Input:', { source, entry_type, has_snapshot: !!snapshot, has_message: !!user_message });
-  
-  if (!process.env.OPENAI_API_KEY) {
-    console.error('CRITICAL: OPENAI_API_KEY not set');
-    throw new Error('OPENAI_API_KEY is required for progress analysis');
-  }
+async function getUserProfile(userId) {
+  if (!userId) throw new Error('userId is required to fetch profile');
 
-  // Read last 30 days from lifemaster_progress
-  const thirtyDaysAgo = DateTime.now().setZone('Asia/Jerusalem').minus({ days: 30 }).toISODate();
-  const { data: recentHistory, error: historyError } = await supabase
-    .from('lifemaster_progress')
+  const { data: profile, error } = await supabase
+    .from('user_profiles')
     .select('*')
-    .gte('entry_date', thirtyDaysAgo)
-    .order('entry_ts', { ascending: false })
-    .limit(50);
+    .eq('user_id', userId)
+    .single();
 
-  if (historyError) {
-    console.error('ERROR fetching history from Supabase:', historyError);
-    throw new Error(`Failed to fetch history: ${historyError.message}`);
+  if (error || !profile) {
+    console.error(`Error fetching profile for user ${userId}:`, error?.message);
+    throw new Error(`Profile not found for user ${userId}`);
   }
-  
-  console.log(`Fetched ${recentHistory?.length || 0} history entries`);
 
-    // Read TRUTH_STATE for context (inline summary)
-    const truthContext = {
-      baseline: {
-        weight_kg: 63.1,
-        resting_hr: 85,
-        hrv_ms: 57,
-        sleep_score: 48,
-        sleep_duration_minutes: 345
-      },
-      goals: {
-        primary: "Body recomposition with visible abs, no weight loss target",
-        secondary: ["Reduce triglycerides", "Improve sleep", "Lower RHR", "Build training habit"]
-      },
-      constraints: {
-        medical: ["Cervical/lumbar disc herniation"],
-        training: "2x30min/week",
-        lifestyle: "Poor sleep 5h45m, evening stress"
-      }
-    };
+  // Calculate age from birth_date
+  const birthDate = DateTime.fromISO(profile.birth_date);
+  const age = Math.floor(DateTime.now().diff(birthDate, 'years').years * 10) / 10;
 
-    // Build prompt for OpenAI
-    const systemPrompt = `You are a clinical health analyst for LifeMaster.
-
-Context:
-- 48.9yo male, 172cm, baseline: 63.1kg, RHR 85bpm, HRV 57ms, Sleep 5h45m
-- Goals: Body recomposition, improve sleep, lower RHR, reduce triglycerides
-- Constraints: Disc herniation, 2x30min training/week, poor sleep
-
-Rules:
-- Prioritize sleep and recovery over all else
-- Weight changes secondary to body composition
-- No extreme recommendations
-- Focus on sustainability
-
-Output ONLY valid JSON:
-{
-  "summary": "2-3 sentence assessment in Hebrew"
-}`;
-
-    const userPrompt = source === 'user' && user_message
-      ? `User message: "${user_message}"\n\nCurrent snapshot: ${JSON.stringify(snapshot)}\n\nRecent history: ${JSON.stringify(recentHistory.slice(0, 5))}`
-      : `Current snapshot: ${JSON.stringify(snapshot)}\n\nRecent history: ${JSON.stringify(recentHistory.slice(0, 5))}`;
-
-    console.log('Calling OpenAI with model:', OPENAI_MODEL);
-    
-    // Call OpenAI (ONE call only)
-    const completion = await openai.chat.completions.create({
-      model: OPENAI_MODEL,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt }
-      ],
-      response_format: { type: "json_object" }
-    });
-
-    const analysis = JSON.parse(completion.choices[0].message.content);
-    console.log('OpenAI analysis received:', { 
-      summary_length: analysis.summary?.length || 0
-    });
-
-    // Persist to lifemaster_progress
-    const today = DateTime.now().setZone('Asia/Jerusalem').toISODate();
-    // Build entry matching actual Supabase schema
-    const progressEntry = {
-      entry_type: entry_type || 'measurement',
-      entry_date: today,
-      source: source || 'withings',
-      title: analysis.summary ? analysis.summary.substring(0, 100) : 'Analysis',
-      notes: analysis.summary || '',
-      metrics: snapshot || {},
-      analysis: analysis, // Full OpenAI analysis as jsonb
-      entry_ts: new Date().toISOString()
-    };
-
-    console.log('=== ATTEMPTING INSERT TO lifemaster_progress ===');
-    console.log('Progress entry:', JSON.stringify(progressEntry, null, 2));
-
-    const { data: savedEntry, error: saveError } = await supabase
-      .from('lifemaster_progress')
-      .insert(progressEntry)
-      .select()
-      .single();
-
-    console.log('PROGRESS INSERT RESULT:', { data: savedEntry, error: saveError });
-
-    if (saveError) {
-      console.error('PROGRESS INSERT ERROR:', saveError);
-      console.error('Full error details:', JSON.stringify(saveError, null, 2));
-      throw new Error(`Failed to insert progress: ${saveError.message} (code: ${saveError.code})`);
-    }
-
-    console.log('✓ Progress saved successfully. Entry ID:', savedEntry?.id);
-    console.log('=== ANALYZE_AND_PERSIST_PROGRESS END ===');
-
-    return {
-      success: true,
-      entry: savedEntry,
-      analysis
-    };
+  return { ...profile, age };
 }
+
+// ===== PROGRESS AGENT CORE FUNCTION =====
+
+// NOTE: analyze_and_persist_progress and runMorningAgent removed in favor of Anthropic Managed Agents
 
 // ===== ENDPOINTS =====
 
-// GET endpoint at /health/daily - Real Withings data
+console.log('REGISTERING /ping');
+app.get('/ping', (req, res) => res.send('pong'));
+
+// ===== ANTHROPIC MANAGED AGENTS =====
+
+// POST /tools/execute removed - using event-stream consumer model instead
+
+// /dev/trigger-agent removed - use GET /agent/execute instead
+// GET endpoint at /health/daily - Real Withings data for a specific user
+// GET endpoint at /health/daily - Manual check for events
 app.get('/health/daily', async (req, res) => {
+  const { user_id } = req.query;
+  if (!user_id) return res.status(400).json({ error: 'user_id is required' });
+
   try {
-    // Get date parameter or default to today in Asia/Jerusalem
-    const dateParam = req.query.date;
-    const debug = req.query.debug === "1";
-    const timezone = 'Asia/Jerusalem';
-    
-    let targetDate;
-    if (dateParam) {
-      targetDate = DateTime.fromISO(dateParam, { zone: timezone });
-      if (!targetDate.isValid) {
-        return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
-      }
-    } else {
-      targetDate = DateTime.now().setZone(timezone);
-    }
-    
-    const dateStr = targetDate.toISODate();
-    const startOfDay = targetDate.startOf('day');
-    const endOfDay = startOfDay.plus({ days: 1 });
-    
-    // Wider window for measurements (3 days back to handle timezone/sync issues)
-    const measureStartTs = Math.floor(startOfDay.minus({ days: 3 }).toSeconds());
-    const measureEndTs = Math.floor(endOfDay.toSeconds());
-    
-    // Original window for sleep (using same day)
-    const startTs = Math.floor(startOfDay.toSeconds());
-    const endTs = Math.floor(endOfDay.toSeconds());
-    
-    // Get valid access token (auto-refreshes if needed)
-    let accessToken;
-    try {
-      accessToken = await tokenStore.getValidAccessToken();
-    } catch (error) {
-      return res.status(401).json({ error: 'withings_not_connected', message: error.message });
-    }
-    
-    const dataPoints = [];
-    const snapshot = {
-      weight_kg: null,
-      heart_pulse_bpm: null,
-      spo2_pct: null,
-      hrv: null,
-      sleep_score: null,
-      sleep_duration_minutes: null
-    };
-    
-    const debugInfo = debug ? { measure: {}, sleep: {} } : null;
-    
-    // Fetch measurements (weight, HR, SpO2, HRV, BP)
-    let measureRes;
-    const measureUrl = 'https://wbsapi.withings.net/measure';
-    const measureParams = {
-      action: 'getmeas',
-      startdate: measureStartTs,
-      enddate: measureEndTs,
-      category: 1,
-      meastypes: '1,11,54,9,10,62'
-    };
-    
-    try {
-      if (debug) {
-        debugInfo.measure.url = measureUrl;
-        debugInfo.measure.action = measureParams.action;
-        debugInfo.measure.startdate = measureParams.startdate;
-        debugInfo.measure.enddate = measureParams.enddate;
-        debugInfo.measure.window_days = Math.ceil((measureEndTs - measureStartTs) / 86400);
-      }
-      
-      measureRes = await withingsClient.formPost(measureUrl, measureParams, accessToken);
-      
-      if (debug) {
-        debugInfo.measure.status = measureRes.status;
-        debugInfo.measure.raw_measuregrps_count = measureRes.body?.measuregrps?.length || 0;
-        
-        if (measureRes.error || measureRes.body?.error) {
-          debugInfo.measure.error = measureRes.error || measureRes.body?.error;
-        }
-        if (measureRes.message || measureRes.body?.message) {
-          debugInfo.measure.message = measureRes.message || measureRes.body?.message;
-        }
-        
-        if (measureRes.body?.measuregrps && measureRes.body.measuregrps.length > 0) {
-          debugInfo.measure.first_two_groups = measureRes.body.measuregrps.slice(0, 2).map(grp => ({
-            date: grp.date,
-            category: grp.category,
-            deviceid: grp.deviceid,
-            measures: grp.measures.map(m => ({
-              type: m.type || m.meastype,
-              value: m.value,
-              unit: m.unit,
-              measure_keys: Object.keys(m)
-            }))
-          }));
-        }
-      }
-      
-      if (measureRes.status !== 0) {
-        console.error('Withings measure API error:', measureRes);
-        if (debug) {
-          return res.status(502).json({ 
-            error: 'withings_api_error', 
-            debug: debugInfo
-          });
-        }
-        return res.status(502).json({ error: 'withings_api_error', details: measureRes });
-      }
-      
-      // Parse measurements
-      if (measureRes.body && measureRes.body.measuregrps) {
-        const latestValues = {};
-        
-        for (const grp of measureRes.body.measuregrps) {
-          for (const measure of grp.measures) {
-            const meastype = measure.type;
-            const actualValue = measure.value * Math.pow(10, measure.unit);
-            
-            // Keep latest value per meastype
-            if (!latestValues[meastype] || grp.date > latestValues[meastype].date) {
-              latestValues[meastype] = {
-                value: actualValue,
-                ts: grp.date,
-                raw: {
-                  meastype,
-                  value: measure.value,
-                  unit: measure.unit,
-                  date: grp.date,
-                  deviceid: grp.deviceid,
-                  category: grp.category
-                }
-              };
-            }
-          }
-        }
-        
-        // Map meastypes to datapoints
-        const typeMapping = {
-          1: { key: 'weight_kg', snapshotKey: 'weight_kg', unit: 'kg' },
-          11: { key: 'heart_pulse_bpm', snapshotKey: 'heart_pulse_bpm', unit: 'bpm' },
-          54: { key: 'spo2_pct', snapshotKey: 'spo2_pct', unit: '%' },
-          62: { key: 'hrv_ms', snapshotKey: 'hrv', unit: 'ms' },
-          9: { key: 'diastolic_mmhg', snapshotKey: null, unit: 'mmHg' },
-          10: { key: 'systolic_mmhg', snapshotKey: null, unit: 'mmHg' }
-        };
-        
-        for (const [meastype, data] of Object.entries(latestValues)) {
-          const mapping = typeMapping[meastype];
-          if (mapping) {
-            dataPoints.push({
-              key: mapping.key,
-              value: data.value,
-              unit: mapping.unit,
-              ts: data.ts,
-              source: 'withings',
-              raw: data.raw
-            });
-            
-            if (mapping.snapshotKey) {
-              snapshot[mapping.snapshotKey] = data.value;
-            }
-          }
-        }
-      }
-    } catch (error) {
-      console.error('⚠️ Error fetching measurements from Withings:', error.message);
-      console.error('Continuing with empty snapshot - Withings is data source, not blocker');
-      // Don't fail the request - continue with empty measurements
-      measureRes = { status: -1, body: { measuregrps: [] }, error: error.message };
-    }
-    
-    // Fetch sleep data
-    let sleepRes;
-    const sleepUrl = 'https://wbsapi.withings.net/v2/sleep';
-    const sleepParams = {
-      action: 'getsummary',
-      startdateymd: dateStr,
-      enddateymd: dateStr
-    };
-    
-    try {
-      if (debug) {
-        debugInfo.sleep.url = sleepUrl;
-        debugInfo.sleep.action = sleepParams.action;
-        debugInfo.sleep.startdateymd = sleepParams.startdateymd;
-        debugInfo.sleep.enddateymd = sleepParams.enddateymd;
-      }
-      
-      sleepRes = await withingsClient.formPost(sleepUrl, sleepParams, accessToken);
-      
-      if (debug) {
-        debugInfo.sleep.status = sleepRes.status;
-        debugInfo.sleep.raw_series_count = sleepRes.body?.series?.length || 0;
-        
-        if (sleepRes.error || sleepRes.body?.error) {
-          debugInfo.sleep.error = sleepRes.error || sleepRes.body?.error;
-        }
-        if (sleepRes.message || sleepRes.body?.message) {
-          debugInfo.sleep.message = sleepRes.message || sleepRes.body?.message;
-        }
-        
-        if (sleepRes.body?.series && sleepRes.body.series.length > 0) {
-          const firstItem = sleepRes.body.series[0];
-          debugInfo.sleep.first_item_keys = Object.keys(firstItem);
-          debugInfo.sleep.first_item_data_keys = firstItem.data ? Object.keys(firstItem.data) : [];
-          debugInfo.sleep.first_item_sample = {
-            startdate: firstItem.startdate,
-            enddate: firstItem.enddate,
-            sleep_score: firstItem.data?.sleep_score,
-            total_sleep_time: firstItem.data?.total_sleep_time,
-            total_timeinbed: firstItem.data?.total_timeinbed
-          };
-        }
-      }
-      
-      if (sleepRes.status !== 0) {
-        console.warn('Withings sleep API error:', sleepRes);
-        if (debug) {
-          debugInfo.sleep.error_detected = true;
-        }
-      } else if (sleepRes.body && sleepRes.body.series && sleepRes.body.series.length > 0) {
-        // Find best overlapping sleep session
-        let bestSleep = null;
-        let maxOverlap = 0;
-        
-        for (const session of sleepRes.body.series) {
-          const sessionStart = session.startdate;
-          const sessionEnd = session.enddate;
-          
-          // Calculate overlap with our target day
-          const overlapStart = Math.max(sessionStart, startTs);
-          const overlapEnd = Math.min(sessionEnd, endTs);
-          const overlap = Math.max(0, overlapEnd - overlapStart);
-          
-          if (overlap > maxOverlap) {
-            maxOverlap = overlap;
-            bestSleep = session;
-          }
-        }
-        
-        if (bestSleep) {
-          // Extract sleep score
-          if (bestSleep.data && bestSleep.data.sleep_score !== undefined) {
-            snapshot.sleep_score = bestSleep.data.sleep_score;
-            dataPoints.push({
-              key: 'sleep_score',
-              value: bestSleep.data.sleep_score,
-              unit: 'score',
-              ts: bestSleep.startdate,
-              source: 'withings',
-              raw: { session: bestSleep }
-            });
-          }
-          
-          // Extract sleep duration
-          const durationSeconds = bestSleep.data?.total_sleep_time || bestSleep.data?.total_timeinbed;
-          if (durationSeconds) {
-            const durationMinutes = Math.round(durationSeconds / 60);
-            snapshot.sleep_duration_minutes = durationMinutes;
-            dataPoints.push({
-              key: 'sleep_duration_minutes',
-              value: durationMinutes,
-              unit: 'minutes',
-              ts: bestSleep.startdate,
-              source: 'withings',
-              raw: { duration_seconds: durationSeconds }
-            });
-          }
-        }
-      }
-    } catch (error) {
-      console.error('⚠️ Error fetching sleep from Withings:', error.message);
-      console.error('Continuing with empty sleep data - Withings is data source, not blocker');
-      // Don't fail the entire request for sleep data
-    }
-    
-    // Return structured response
-    const response = {
-      date: dateStr,
-      window: {
-        start_ts: startTs,
-        end_ts: endTs,
-        timezone,
-        measure_window: {
-          start_ts: measureStartTs,
-          end_ts: measureEndTs,
-          days_back: 3
-        }
-      },
-      data_points: dataPoints,
-      snapshot
-    };
-    
-    if (debug) {
-      response.debug = debugInfo;
-    }
-    
-    // ===== TRIGGER PROGRESS AGENT ON SIGNIFICANT CHANGE =====
-    // Check if there's a significant change compared to recent measurements
-    try {
-      const { data: recentMeasurements } = await supabase
-        .from('lifemaster_progress')
-        .select('metrics')
-        .eq('source', 'withings')
-        .eq('entry_type', 'measurement')
-        .order('entry_ts', { ascending: false })
-        .limit(1);
-
-      let shouldTriggerAgent = false;
-      
-      if (!recentMeasurements || recentMeasurements.length === 0) {
-        // No previous measurement, this is the first one
-        shouldTriggerAgent = true;
-      } else {
-        const lastMetrics = recentMeasurements[0].metrics;
-        
-        // Check for significant changes
-        const changes = {
-          weight: snapshot.weight_kg && lastMetrics.weight_kg 
-            ? Math.abs(snapshot.weight_kg - lastMetrics.weight_kg) 
-            : 0,
-          rhr: snapshot.heart_pulse_bpm && lastMetrics.heart_pulse_bpm
-            ? Math.abs(snapshot.heart_pulse_bpm - lastMetrics.heart_pulse_bpm)
-            : 0,
-          hrv: snapshot.hrv && lastMetrics.hrv
-            ? Math.abs((snapshot.hrv - lastMetrics.hrv) / lastMetrics.hrv * 100)
-            : 0,
-          sleep: snapshot.sleep_duration_minutes && lastMetrics.sleep_duration_minutes
-            ? Math.abs(snapshot.sleep_duration_minutes - lastMetrics.sleep_duration_minutes)
-            : 0
-        };
-
-        // Thresholds: weight ≥0.5kg, RHR ≥5bpm, HRV ≥10%, sleep ≥60min
-        shouldTriggerAgent = 
-          changes.weight >= 0.5 ||
-          changes.rhr >= 5 ||
-          changes.hrv >= 10 ||
-          changes.sleep >= 60;
-
-        if (debug && shouldTriggerAgent) {
-          response.agent_trigger = { reason: 'significant_change', changes };
-        }
-      }
-
-      // Trigger agent analysis if significant change detected
-      if (shouldTriggerAgent) {
-        const agentResult = await analyze_and_persist_progress({
-          snapshot,
-          source: 'withings',
-          entry_type: 'measurement'
-        });
-        
-        if (debug && agentResult.success) {
-          response.agent_analysis = agentResult.analysis;
-        }
-      }
-    } catch (agentError) {
-      console.error('Error in agent trigger logic:', agentError);
-      // Don't fail the request if agent fails
-    }
-    
-    res.json(response);
-    
+    const { data } = await supabase
+      .from('lifemaster_events')
+      .select('*')
+      .eq('user_id', user_id)
+      .order('occurred_at', { ascending: false })
+      .limit(10);
+    res.json({ count: data.length, entries: data });
   } catch (error) {
-    console.error('Error in /health/daily:', error);
     res.status(500).json({ error: 'internal_error', message: error.message });
   }
 });
+
+// Endpoints consolidated above
 
 
 
@@ -614,19 +190,119 @@ paths:
 `);
 });
 
+// ===== CORE OAUTH FLOW (PHASE 1) =====
+
+/**
+ * Initiate Withings OAuth flow for a specific user.
+ * Validates user_id format and existence.
+ */
+app.get('/connect-withings', async (req, res) => {
+  const { user_id } = req.query;
+
+  // 1. Validate UUID format
+  if (!user_id || !UUID_REGEX.test(user_id)) {
+    return res.status(400).json({ error: 'Invalid or missing user_id. Must be a valid UUID.' });
+  }
+
+  try {
+    // 2. Verify user exists in DB
+    const { data: profile, error } = await supabase
+      .from('user_profiles')
+      .select('user_id')
+      .eq('user_id', user_id)
+      .maybeSingle();
+
+    if (error || !profile) {
+      return res.status(404).json({ error: 'User profile not found. Connection cannot be initiated.' });
+    }
+
+    // 3. Construct Auth URL
+    const clientId = process.env.WITHINGS_CLIENT_ID;
+    const redirectUri = encodeURIComponent(`${process.env.WITHINGS_REDIRECT_URI || 'http://localhost:3000/api/withings/callback'}`);
+
+    const authUrl = `https://account.withings.com/oauth2_user/authorize2?response_type=code&client_id=${clientId}&redirect_uri=${redirectUri}&scope=user.info,user.metrics,user.activity&state=${user_id}`;
+
+    console.log(`OAuth initiation for user ${user_id}`);
+    res.redirect(authUrl);
+
+  } catch (error) {
+    console.error('Connect error:', error.message);
+    res.status(500).json({ error: 'Internal server error during connection initiation' });
+  }
+});
+
+/**
+ * Callback for Withings OAuth.
+ * Strictly uses state as user_id and validates Withings response.
+ */
+app.get('/api/withings/callback', async (req, res) => {
+  const { code, state: userId } = req.query;
+
+  if (!code || !userId) {
+    return res.status(400).send('Missing code or state (user_id)');
+  }
+
+  console.log(`Processing Withings callback for user ${userId}`);
+
+  const tokenUrl = 'https://wbsapi.withings.net/v2/oauth2';
+  const params = new URLSearchParams({
+    action: 'requesttoken',
+    grant_type: 'authorization_code',
+    client_id: process.env.WITHINGS_CLIENT_ID,
+    client_secret: process.env.WITHINGS_CLIENT_SECRET,
+    code,
+    redirect_uri: process.env.WITHINGS_REDIRECT_URI || 'http://localhost:3000/api/withings/callback'
+  });
+
+  try {
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params
+    });
+
+    const data = await response.json();
+
+    // 1. Strict validation of Withings response status
+    if (data.status !== 0) {
+      console.error('Withings Token Exchange Failed:', data);
+      return res.status(502).json({
+        error: 'Withings API error',
+        details: data.error || 'Unknown error',
+        status: data.status
+      });
+    }
+
+    // 2. Store tokens with user scoping
+    const saveResult = await tokenStore.saveWithingsTokens(userId, data.body);
+
+    if (!saveResult.ok) {
+      return res.status(500).json({ error: 'Failed to persist tokens', details: saveResult.reason });
+    }
+
+    res.json({
+      status: 'success',
+      message: 'Withings account linked successfully',
+      user_id: userId
+    });
+
+  } catch (error) {
+    console.error('Callback error:', error.message);
+    res.status(500).json({ error: 'Internal server error during token exchange' });
+  }
+});
+
 app.get("/auth/withings/callback", async (req, res) => {
   console.log("CALLBACK - Reached token exchange");
-  console.log("CALLBACK - CLIENT_ID present:", !!process.env.WITHINGS_CLIENT_ID);
-  console.log("CALLBACK - CLIENT_SECRET present:", !!process.env.WITHINGS_CLIENT_SECRET);
-  
   const code = req.query.code;
+  const userId = req.query.state; // Extraction of user_id from state
 
-  if (!code) {
-    return res.status(400).send("No authorization code received");
+  if (!code) return res.status(400).send("No authorization code received");
+  if (!userId || userId === 'lifemaster') {
+    return res.status(400).send("No user_id found in state. Initiation must include user_id.");
   }
 
   const tokenUrl = "https://wbsapi.withings.net/v2/oauth2";
-
   const params = new URLSearchParams({
     action: "requesttoken",
     grant_type: "authorization_code",
@@ -635,50 +311,41 @@ app.get("/auth/withings/callback", async (req, res) => {
     code,
     redirect_uri: "https://lifemaster-health-api.onrender.com/auth/withings/callback"
   });
-  
-  console.log("CALLBACK - Params include client_id:", params.has('client_id'));
-  console.log("CALLBACK - Params include client_secret:", params.has('client_secret'));
-  console.log("CALLBACK - Params include code:", params.has('code'));
-  console.log("CALLBACK - Params include redirect_uri:", params.has('redirect_uri'));
 
-  const response = await fetch(tokenUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params
-  });
-
-  const data = await response.json();
-
-  if (data.status !== 0) {
-    return res.status(500).json(data);
-  }
-
-  // Save tokens to persistent storage
-  const saveResult = await tokenStore.saveTokens(
-    data.body.access_token,
-    data.body.refresh_token,
-    data.body.expires_in
-  );
-
-  if (!saveResult.ok) {
-    return res.status(500).json({ 
-      error: "Failed to save tokens", 
-      details: saveResult 
+  try {
+    const response = await fetch(tokenUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params
     });
-  }
 
-  res.json({
-    message: "OAuth success - tokens saved",
-    expires_in: data.body.expires_in
-  });
+    const data = await response.json();
+    if (data.status !== 0) return res.status(500).json(data);
+
+    // Save tokens to persistent storage for the specific user
+    const saveResult = await tokenStore.saveTokens(
+      userId,
+      data.body.access_token,
+      data.body.refresh_token,
+      data.body.expires_in
+    );
+
+    if (!saveResult.ok) {
+      return res.status(500).json({ error: "Failed to save tokens", userId, details: saveResult });
+    }
+
+    res.json({ message: "OAuth success - tokens saved", userId, expires_in: data.body.expires_in });
+  } catch (error) {
+    res.status(500).json({ error: "OAuth execution failed", details: error.message });
+  }
 });
 
 app.get("/auth/withings", (req, res) => {
+  const { user_id } = req.query;
   const clientId = process.env.WITHINGS_CLIENT_ID;
 
-  if (!clientId) {
-    return res.status(500).send("WITHINGS_CLIENT_ID is not set");
-  }
+  if (!user_id) return res.status(400).send("user_id is required to initiate auth");
+  if (!clientId) return res.status(500).send("WITHINGS_CLIENT_ID is not set");
 
   const redirectUri = "https://lifemaster-health-api.onrender.com/auth/withings/callback";
 
@@ -688,32 +355,26 @@ app.get("/auth/withings", (req, res) => {
     `&client_id=${clientId}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
     `&scope=user.info,user.metrics,user.activity` +
-    `&state=lifemaster`;
+    `&state=${user_id}`; // Passing user_id as state
 
   res.redirect(authUrl);
 });
 
 app.get("/withings/weight", async (req, res) => {
-  // Load access token from storage
-  const tokens = await tokenStore.getTokens();
-  
-  if (!tokens) {
-    return res.status(401).json({ error: "No tokens found. Please authenticate first." });
-  }
+  const { user_id: userId } = req.query;
+  if (!userId) return res.status(400).json({ error: "user_id is required" });
 
-  // Check if token is expired
-  if (await tokenStore.isTokenExpired()) {
-    return res.status(401).json({ error: "Token expired. Re-authentication required." });
-  }
-
-  // Call Withings measure API
-  const measureUrl = "https://wbsapi.withings.net/measure?action=getmeas&meastype=1&category=1&lastupdate=0";
-  
   try {
+    // Get a valid access token for this specific user
+    const accessToken = await tokenStore.getValidAccessToken(userId);
+
+    // Call Withings measure API
+    const measureUrl = "https://wbsapi.withings.net/measure?action=getmeas&meastype=1&category=1&lastupdate=0";
+
     const response = await fetch(measureUrl, {
       method: "GET",
       headers: {
-        "Authorization": `Bearer ${tokens.access_token}`
+        "Authorization": `Bearer ${accessToken}`
       }
     });
 
@@ -730,14 +391,14 @@ app.get("/withings/weight", async (req, res) => {
 
     // Get last 10 measurement groups (preserve Withings API order)
     const measureGroups = data.body.measuregrps.slice(0, 10);
-    
+
     const measurements = measureGroups.map(group => {
       const weightMeasure = group.measures.find(m => m.type === 1);
-      
+
       if (!weightMeasure) {
         return null;
       }
-      
+
       // Return RAW fields for inspection
       return {
         value: weightMeasure.value,
@@ -764,17 +425,19 @@ app.get("/withings/weight", async (req, res) => {
 
 // ===== AGENT PROGRESS ENDPOINTS =====
 
-// GET /agent/state - Read recent progress entries
+// GET /agent/state - Read recent progress entries for a specific user
 app.get("/agent/state", async (req, res) => {
+  const { user_id } = req.query;
+  if (!user_id) return res.status(400).json({ error: "user_id is required" });
+
   const { data, error } = await supabase
-    .from("lifemaster_progress")
+    .from("lifemaster_events")
     .select("*")
-    .order("entry_ts", { ascending: false })
+    .eq("user_id", user_id)
+    .order("occurred_at", { ascending: false })
     .limit(100);
 
-  if (error) {
-    return res.status(500).json({ error: error.message });
-  }
+  if (error) return res.status(500).json({ error: error.message });
 
   res.json({
     count: data.length,
@@ -782,53 +445,30 @@ app.get("/agent/state", async (req, res) => {
   });
 });
 
-// POST /agent/event - Write manual events
-app.post("/agent/event", async (req, res) => {
-  const payload = {
-    ...req.body,
-    entry_ts: new Date().toISOString()
-  };
+// POST /agent/event - See line ~857 for the managed agents implementation
 
-  const { data, error } = await supabase
-    .from("lifemaster_progress")
-    .insert(payload)
-    .select()
-    .single();
-
-  if (error) {
-    return res.status(500).json({ error: error.message });
-  }
-
-  res.json({
-    status: "saved",
-    entry: data
-  });
-});
-
-// POST /agent/commit - Write agent decisions (requires consent)
+// POST /agent/commit - Write agent decisions for a user (requires consent)
 app.post("/agent/commit", async (req, res) => {
-  const { consent } = req.body;
+  const { user_id, consent, ...rest } = req.body;
+  if (!user_id) return res.status(400).json({ error: "user_id is required" });
 
   if (!consent || consent.status !== "granted") {
-    return res.status(403).json({
-      error: "Consent not granted"
-    });
+    return res.status(403).json({ error: "Consent not granted" });
   }
 
   const payload = {
-    ...req.body,
-    entry_ts: new Date().toISOString()
+    user_id,
+    ...rest,
+    occurred_at: new Date().toISOString()
   };
 
   const { data, error } = await supabase
-    .from("lifemaster_progress")
+    .from("lifemaster_events")
     .insert(payload)
     .select()
     .single();
 
-  if (error) {
-    return res.status(500).json({ error: error.message });
-  }
+  if (error) return res.status(500).json({ error: error.message });
 
   res.json({
     status: "committed",
@@ -839,11 +479,10 @@ app.post("/agent/commit", async (req, res) => {
 // POST /agent/chat - OpenAI-powered agent with tool calling
 app.post("/agent/chat", async (req, res) => {
   try {
-    const { message } = req.body;
-    
-    if (!message) {
-      return res.status(400).json({ error: "Message is required" });
-    }
+    const { message, user_id: userId } = req.body;
+
+    if (!message) return res.status(400).json({ error: "Message is required" });
+    if (!userId) return res.status(400).json({ error: "user_id is required" });
 
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({ error: "OPENAI_API_KEY not configured" });
@@ -852,15 +491,14 @@ app.post("/agent/chat", async (req, res) => {
     // Check for explicit consent words in Hebrew
     const hasConsent = /מאשר|תעדכן|בצע/.test(message);
 
-    // Store incoming message as event
-    const today = DateTime.now().setZone('Asia/Jerusalem').toISODate();
-    await supabase.from("lifemaster_progress").insert({
+    // Store incoming message as event for that user
+    await supabase.from("lifemaster_events").insert({
+      user_id: userId,
       entry_type: "event",
-      entry_date: today,
       source: "manual",
       title: "User message",
       notes: message,
-      entry_ts: new Date().toISOString()
+      occurred_at: new Date().toISOString()
     });
 
     // Define tools for OpenAI function calling
@@ -869,7 +507,7 @@ app.post("/agent/chat", async (req, res) => {
         type: "function",
         function: {
           name: "get_agent_state",
-          description: "Retrieve recent progress entries from the lifemaster_progress table. Returns up to 100 recent entries ordered by timestamp descending.",
+          description: "Retrieve recent health events and progress from the lifemaster_events table for the current user.",
           parameters: {
             type: "object",
             properties: {},
@@ -943,23 +581,28 @@ app.post("/agent/chat", async (req, res) => {
       }
     ];
 
+    // Fetch real user profile from Supabase for the legacy agent
+    const profile = await getUserProfile(userId);
+
     // System prompt for the agent
     const systemPrompt = `You are a professional health and fitness coach assistant for the LifeMaster system.
+ 
+User Profile:
+- Name: ${profile.full_name}
+- Age: ${profile.age}
+- Goals: ${JSON.stringify(profile.goals)}
+- Constraints: ${JSON.stringify(profile.medical_constraints)}
 
 Your role:
 - Analyze user health data (sleep, weight, HRV, training adherence)
 - Provide evidence-based guidance focused on sustainability
 - Prioritize sleep, recovery, and adherence over aggressive optimization
-- Never suggest extreme interventions
 
 CRITICAL RULES:
-1. Read TRUTH_STATE.md principles: no extreme diets, prioritize adherence and recovery
-2. NEVER call commit_agent_decision unless the user explicitly gave consent with words: "מאשר", "תעדכן", or "בצע"
-3. If proposing changes without consent, explain the plan and ASK for explicit approval
-4. Always call get_agent_state first to understand current context
-5. Log observations using create_agent_event when appropriate
-
-Current consent status: ${hasConsent ? "GRANTED - you may commit decisions" : "NOT GRANTED - only propose, do not commit"}
+1. NEVER call commit_agent_decision unless the user explicitly gave consent with words: "מאשר", "תעדכן", or "בצע"
+2. If proposing changes without consent, explain the plan and ASK for explicit approval
+3. Always call get_agent_state first to understand current context
+4. Log observations using create_agent_event when appropriate
 
 Respond in Hebrew (עברית) with professional, clear language.`;
 
@@ -1003,8 +646,8 @@ Respond in Hebrew (עברית) with professional, clear language.`;
 
         try {
           if (functionName === "get_agent_state") {
-            // Call GET /agent/state
-            const stateResponse = await fetch(`${AGENT_API_BASE}/agent/state`);
+            // Call GET /agent/state with explicit user_id scoping
+            const stateResponse = await fetch(`${AGENT_API_BASE}/agent/state?user_id=${userId}`);
             functionResult = await stateResponse.json();
 
           } else if (functionName === "create_agent_event") {
@@ -1021,7 +664,7 @@ Respond in Hebrew (עברית) with professional, clear language.`;
             const eventResponse = await fetch(`${AGENT_API_BASE}/agent/event`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(eventPayload)
+              body: JSON.stringify({ ...eventPayload, user_id: userId })
             });
             functionResult = await eventResponse.json();
 
@@ -1049,10 +692,10 @@ Respond in Hebrew (עברית) with professional, clear language.`;
               const commitResponse = await fetch(`${AGENT_API_BASE}/agent/commit`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(commitPayload)
+                body: JSON.stringify({ ...commitPayload, user_id: userId })
               });
               functionResult = await commitResponse.json();
-              
+
               if (functionResult.status === "committed") {
                 committed = true;
               }
@@ -1099,31 +742,28 @@ Respond in Hebrew (עברית) with professional, clear language.`;
     console.log('Message:', message.substring(0, 50));
     console.log('Detected entry_type:', chatEntryType);
 
-    // Get current snapshot from recent progress data
+    // Get current snapshot for this user from their latest event
     const { data: recentMetrics } = await supabase
-      .from('lifemaster_progress')
+      .from('lifemaster_events')
       .select('metrics')
+      .eq('user_id', userId)
       .not('metrics', 'is', null)
-      .order('entry_ts', { ascending: false })
+      .order('occurred_at', { ascending: false })
       .limit(1);
 
-    const currentSnapshot = recentMetrics && recentMetrics.length > 0 
-      ? recentMetrics[0].metrics 
+    const currentSnapshot = recentMetrics && recentMetrics.length > 0
+      ? recentMetrics[0].metrics
       : { weight_kg: null, heart_pulse_bpm: null, hrv: null, sleep_duration_minutes: null };
 
     console.log('Current snapshot:', currentSnapshot);
 
-    // Always call analyze_and_persist_progress for user chat
-    // NO SILENT FAILURES - throw errors up
-    const chatAnalysis = await analyze_and_persist_progress({
-      snapshot: currentSnapshot,
-      source: 'user',
-      entry_type: chatEntryType,
-      user_message: message
+    // NOTE: analyze_and_persist_progress removed. Logic moved to autonomous agent.
+    
+    res.json({
+      reply: assistantReply,
+      committed: committed,
+      tool_trace: toolTrace
     });
-
-    console.log('✓ Chat analysis completed and persisted');
-    console.log('Entry ID:', chatAnalysis.entry?.id);
 
     res.json({
       reply: assistantReply,
@@ -1140,11 +780,194 @@ Respond in Hebrew (עברית) with professional, clear language.`;
   }
 });
 
+console.log('REGISTERING /ping-end');
+app.get('/ping-end', (req, res) => res.send('pong-end'));
+
+// ===== MANAGED AGENT ENDPOINTS =====
+// Execute autonomous health agent for a user
+app.get('/agent/execute', async (req, res) => {
+  const { user_id, trigger_type } = req.query;
+
+  if (!user_id) {
+    return res.status(400).json({ error: 'user_id is required' });
+  }
+
+  const triggerType = trigger_type || 'manual';
+  console.log(`\n[API] GET /agent/execute for user ${user_id} (trigger: ${triggerType})`);
+
+  try {
+    // Get or create session for this user
+    const sessionId = await sessionManager.getOrCreateSession(user_id);
+
+    // Start consumer (if not already running) with trigger type
+    consumerPool.startConsumer(sessionId, user_id, SessionConsumer, triggerType);
+
+    // Send event to Anthropic session
+    // Consumer will handle tool calls and completion
+    await agentEvents.sendEvent(sessionId, triggerType, {
+      timestamp: new Date().toISOString(),
+    });
+
+    return res.json({
+      status: 'success',
+      user_id,
+      trigger_type: triggerType,
+      session_id: sessionId,
+      message: 'Event sent to Anthropic agent'
+    });
+  } catch (error) {
+    console.error(`[API] Agent execution failed:`, error.message);
+    return res.status(500).json({
+      error: 'Agent execution failed',
+      details: error.message
+    });
+  }
+});
+
+// Trigger agent for event (supermarket, workout completed, etc.)
+app.post('/agent/event', async (req, res) => {
+  const { user_id, event_type, data } = req.body;
+
+  if (!user_id || !event_type) {
+    return res.status(400).json({ error: 'user_id and event_type required' });
+  }
+
+  console.log(`[API] POST /agent/event: ${event_type} for user ${user_id}`);
+
+  try {
+    // Store event in lifemaster_events
+    const { error: eventError } = await supabase
+      .from('lifemaster_events')
+      .insert({
+        user_id,
+        title: `User event: ${event_type}`,
+        event_type: 'event',
+        source: 'user',
+        metrics: data || {},
+        occurred_at: new Date().toISOString()
+      });
+
+    if (eventError) throw eventError;
+
+    // Trigger agent in background if event is triggerable
+    const triggerableEvents = ['at_supermarket', 'workout_completed', 'meal_logged', 'anomaly_detected'];
+    if (triggerableEvents.includes(event_type)) {
+      // Don't await - send event in background
+      (async () => {
+        try {
+          const sessionId = await sessionManager.getOrCreateSession(user_id);
+
+          // Start consumer (if not already running) with trigger type
+          consumerPool.startConsumer(sessionId, user_id, SessionConsumer, event_type);
+
+          // Send event to Anthropic
+          await agentEvents.sendEvent(sessionId, 'event', {
+            event_type,
+            data,
+            timestamp: new Date().toISOString()
+          });
+        } catch (error) {
+          console.error(`[Background] Event trigger failed:`, error.message);
+        }
+      })();
+    }
+
+    return res.json({
+      status: 'event_recorded',
+      user_id,
+      event_type
+    });
+  } catch (error) {
+    console.error(`[API] Event handling failed:`, error.message);
+    return res.status(500).json({
+      error: 'Event handling failed',
+      details: error.message
+    });
+  }
+});
+
+console.log('REGISTERING /agent endpoints');
+
+// ===== WHATSAPP WEBHOOK =====
+const { handleIncomingMessage } = require('./whatsapp');
+
+app.post('/webhook/whatsapp', (req, res) => {
+  // Respond to Twilio immediately — processing happens in background
+  res.sendStatus(200);
+
+  const from = req.body.From;  // "whatsapp:+972501234567"
+  const body = req.body.Body;  // message text
+
+  if (!from || !body) return;
+
+  handleIncomingMessage(from, body).catch(err =>
+    console.error(`[WHATSAPP] Unhandled error for ${from}:`, err.message)
+  );
+});
+
 // Start server on port from environment or default to 3000
 const PORT = process.env.PORT || 3000;
+console.log('INDEX LOADED');
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
-  console.log("ENV CHECK - CLIENT_ID:", !!process.env.WITHINGS_CLIENT_ID);
-  console.log("ENV CHECK - CLIENT_SECRET:", !!process.env.WITHINGS_CLIENT_SECRET);
+  console.log("ENV CHECK - WITHINGS_CLIENT_ID:", !!process.env.WITHINGS_CLIENT_ID);
+
+  // Initialize Cron Jobs
+
+  // WITHINGS SYNC — 07:30, 16:00, 22:00 Jerusalem time
+  for (const cronTime of ['30 7 * * *', '0 16 * * *', '0 22 * * *']) {
+    cron.schedule(cronTime, async () => {
+      console.log(`CRON: Withings sync (${cronTime})...`);
+      await syncAllUsers().catch(err =>
+        console.error('CRON: Withings sync failed:', err.message)
+      );
+    }, { timezone: "Asia/Jerusalem" });
+  }
+
+  // Helper: trigger agent event for all active users
+  async function triggerForAllUsers(triggerType, sendEventFn) {
+    console.log(`CRON: Triggering ${triggerType} for all active users...`);
+    try {
+      const users = await sessionManager.getActiveUsers();
+      console.log(`CRON: ${users.length} users`);
+      for (const user of users) {
+        (async () => {
+          try {
+            const sessionId = await sessionManager.getOrCreateSession(user.user_id);
+            consumerPool.startConsumer(sessionId, user.user_id, SessionConsumer, triggerType);
+            await sendEventFn(sessionId);
+          } catch (err) {
+            console.error(`CRON: ${triggerType} failed for ${user.user_id}:`, err.message);
+          }
+        })();
+      }
+    } catch (err) {
+      console.error(`CRON: Failed to fetch users for ${triggerType}:`, err.message);
+    }
+  }
+
+  // 08:30 — Morning greeting (after 07:30 Withings sync)
+  cron.schedule('30 8 * * *', () =>
+    triggerForAllUsers('morning_greeting', agentEvents.sendMorningEvent),
+    { timezone: "Asia/Jerusalem" }
+  );
+
+  // 13:00 — Lunch suggestion
+  cron.schedule('0 13 * * *', () =>
+    triggerForAllUsers('lunch_time', agentEvents.sendLunchEvent),
+    { timezone: "Asia/Jerusalem" }
+  );
+
+  // 19:30 — Dinner suggestion
+  cron.schedule('30 19 * * *', () =>
+    triggerForAllUsers('dinner_time', agentEvents.sendDinnerEvent),
+    { timezone: "Asia/Jerusalem" }
+  );
+
+  // 21:00 — Evening check-in
+  cron.schedule('0 21 * * *', () =>
+    triggerForAllUsers('evening_checkin', agentEvents.sendEveningEvent),
+    { timezone: "Asia/Jerusalem" }
+  );
 });
 
